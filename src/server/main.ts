@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
 declare global {
   var __CODEX_SHIM_VALUES__: {
@@ -11,11 +11,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { parseArgs as parseCliArgs } from "node:util";
-import { WebSocket, WebSocketServer } from "ws";
-import Fastify from "fastify";
-import fastifyMultipart from "@fastify/multipart";
-import fastifyStatic from "@fastify/static";
-import { installModuleAliasHook } from "./module";
+import { Hono } from "hono";
+import { serveStatic, upgradeWebSocket, websocket } from "hono/bun";
+import type { WSContext, WSMessageReceive } from "hono/ws";
 import { glob } from "glob";
 
 type ServerOptions = {
@@ -118,6 +116,9 @@ type IpcMainBridgeState = {
   handleRendererSend?: (channel: string, args: unknown[]) => void;
 };
 
+const OPEN_WEBSOCKET_READY_STATE = 1;
+const MAX_REQUEST_BODY_SIZE = 1024 ** 4;
+
 function printUsage(): void {
   console.log(
     [
@@ -129,8 +130,8 @@ function printUsage(): void {
       "  --port 8214",
       "",
       "Examples:",
-      "  yarn server",
-      "  yarn server --port 9000",
+      "  bun run server",
+      "  bun run server --port 9000",
     ].join("\n"),
   );
 }
@@ -190,6 +191,25 @@ function errorMessage(error: unknown): string {
   return String(error);
 }
 
+async function websocketMessageText(data: WSMessageReceive): Promise<string> {
+  if (typeof data === "string") {
+    return data;
+  }
+  if (data instanceof Blob) {
+    return await data.text();
+  }
+  return new TextDecoder().decode(data);
+}
+
+function sendWebSocketMessage(
+  socket: WSContext,
+  message: MainToRendererMessage,
+): void {
+  if (socket.readyState === OPEN_WEBSOCKET_READY_STATE) {
+    socket.send(JSON.stringify(message));
+  }
+}
+
 async function getWorkspaceDirectoryEntries({
   directoryPath,
   directoriesOnly,
@@ -246,9 +266,13 @@ function ensureElectronLikeProcessContext(): void {
   }
 
   const processWithElectronFields = process as NodeJS.Process & {
+    _linkedBinding?: unknown;
     resourcesPath?: string;
     type?: string;
   };
+  // Bun exposes this Node-internal hook but returns undefined for unknown
+  // bindings. Electron callers expect an unsupported binding to be absent.
+  processWithElectronFields._linkedBinding = undefined;
   processWithElectronFields.resourcesPath ??= path.resolve(
     __dirname,
     "../../scratch/asar",
@@ -258,185 +282,183 @@ function ensureElectronLikeProcessContext(): void {
 
 async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
   const bridgeState = getIpcMainBridgeState();
-  const app = Fastify({ logger: false });
-  const websocketServer = new WebSocketServer({ noServer: true });
-  const sockets = new Set<WebSocket>();
-
-  await app.register(fastifyMultipart, {
-    limits: {
-      fileSize: Infinity,
-    },
-  });
+  const app = new Hono();
+  const sockets = new Map<unknown, WSContext>();
 
   const uploadRoot = await fs.mkdtemp(
     path.join(os.tmpdir(), "codex-web-uploads-"),
   );
+  const webviewRoot = path.resolve(__dirname, "../../scratch/asar/webview");
 
-  app.post("/__backend/upload", async (request, reply) => {
-    if (!request.isMultipart()) {
-      return reply.code(400).send({ error: "expected multipart upload body" });
+  app.post("/__backend/upload", async (context) => {
+    const contentType = context.req.header("content-type")?.toLowerCase();
+    if (!contentType?.startsWith("multipart/form-data")) {
+      return context.json({ error: "expected multipart upload body" }, 400);
     }
 
-    const files = await Array.fromAsync(
-      (async function* () {
-        for await (const part of request.files()) {
-          const label = part.filename?.trim() || "upload";
+    const formData = await context.req.raw.formData();
+    const parts: Bun.FormDataEntryValue[] = [];
+    formData.forEach((part) => parts.push(part));
+    const files = [];
+    for (const part of parts) {
+      if (!(part instanceof File)) {
+        continue;
+      }
 
-          const uploadedPath = path.join(uploadRoot, randomUUID());
+      const uploadedPath = path.join(uploadRoot, randomUUID());
+      await Bun.write(uploadedPath, part);
+      files.push({
+        label: part.name.trim() || "upload",
+        path: uploadedPath,
+        fsPath: uploadedPath,
+      });
+    }
 
-          await fs.writeFile(uploadedPath, await part.toBuffer());
+    return context.json({ files });
+  });
 
-          yield {
-            label,
-            path: uploadedPath,
-            fsPath: uploadedPath,
-          };
+  app.get(
+    "/__backend/ipc",
+    upgradeWebSocket(() => ({
+      onOpen(_event, socket) {
+        sockets.set(socket.raw, socket);
+      },
+      onClose(_event, socket) {
+        sockets.delete(socket.raw);
+      },
+      onError(_event, socket) {
+        sockets.delete(socket.raw);
+      },
+      async onMessage(event, socket) {
+        let message: RendererToMainMessage;
+        try {
+          message = JSON.parse(
+            await websocketMessageText(event.data),
+          ) as RendererToMainMessage;
+        } catch (error) {
+          console.error("[ipc-bridge] invalid JSON payload", error);
+          return;
         }
-      })(),
-    );
 
-    return reply.send({ files });
+        if (message.type === "ipc-renderer-send") {
+          bridgeState.handleRendererSend?.(message.channel, message.args);
+          return;
+        }
+
+        if (message.type === "workspace-directory-entries-request") {
+          const { requestId } = message;
+          getWorkspaceDirectoryEntries(message)
+            .then((result) => {
+              sendWebSocketMessage(socket, {
+                type: "workspace-directory-entries-result",
+                requestId,
+                ok: true,
+                result,
+              });
+            })
+            .catch((error) => {
+              sendWebSocketMessage(socket, {
+                type: "workspace-directory-entries-result",
+                requestId,
+                ok: false,
+                errorMessage: errorMessage(error),
+              });
+            });
+          return;
+        }
+
+        if (message.type === "ipc-renderer-invoke") {
+          const { channel, requestId, args } = message;
+          Promise.resolve(
+            bridgeState.handleRendererInvoke?.(channel, args) ??
+              Promise.reject(
+                new Error(
+                  `[ipc-bridge] no ipcMain.handle for channel ${channel}`,
+                ),
+              ),
+          )
+            .then((result) => {
+              sendWebSocketMessage(socket, {
+                type: "ipc-renderer-invoke-result",
+                requestId,
+                ok: true,
+                result,
+              });
+            })
+            .catch((error) => {
+              sendWebSocketMessage(socket, {
+                type: "ipc-renderer-invoke-result",
+                requestId,
+                ok: false,
+                errorMessage: errorMessage(error),
+              });
+            });
+        }
+      },
+    })),
+  );
+
+  app.use(
+    "/@fs/*",
+    serveStatic({
+      root: "/",
+      rewriteRequestPath: (requestPath) => requestPath.slice("/@fs".length),
+    }),
+  );
+
+  app.all("/@fs/*", (context) => context.json({ error: "Not Found" }, 404));
+
+  app.use("/*", serveStatic({ root: webviewRoot }));
+  app.get("*", serveStatic({ root: webviewRoot, path: "index.html" }));
+
+  app.notFound((context) => {
+    return context.json({ error: "Not Found" }, 404);
   });
 
-  await app.register(fastifyStatic, {
-    root: "/",
-    prefix: "/@fs/",
-    decorateReply: false,
-  });
-
-  await app.register(fastifyStatic, {
-    root: path.resolve(__dirname, "../../scratch/asar/webview"),
-    prefix: "/",
-  });
-
-  app.get("/", async (_request, reply) => {
-    return reply.sendFile("index.html");
-  });
-
-  app.setNotFoundHandler((request, reply) => {
-    if (request.url.startsWith("/@fs/")) {
-      return reply.code(404).send({ error: "Not Found" });
-    }
-
-    if (request.method === "GET") {
-      return reply.sendFile("index.html");
-    }
-    return reply.code(404).send({ error: "Not Found" });
-  });
-
-  app.server.on("upgrade", (request, socket, head) => {
-    const requestUrl = request.url ?? "/";
-    const host = request.headers.host ?? "localhost";
-    const url = new URL(requestUrl, `http://${host}`);
-    if (url.pathname !== "/__backend/ipc") {
-      socket.destroy();
-      return;
-    }
-
-    websocketServer.handleUpgrade(request, socket, head, (upgradedSocket) => {
-      websocketServer.emit("connection", upgradedSocket, request);
-    });
+  app.onError((error, context) => {
+    console.error("[ipc-bridge] request failed", error);
+    return context.json({ error: "Internal Server Error" }, 500);
   });
 
   bridgeState.broadcastToRenderer = (message: MainToRendererMessage): void => {
-    const payload = JSON.stringify(message);
-    for (const socket of sockets) {
-      if (socket.readyState === WebSocket.OPEN) {
-        socket.send(payload);
-      }
+    for (const socket of sockets.values()) {
+      sendWebSocketMessage(socket, message);
     }
   };
 
-  websocketServer.on("connection", (socket) => {
-    sockets.add(socket);
-
-    socket.on("close", () => {
-      sockets.delete(socket);
-    });
-
-    socket.on("message", (rawData) => {
-      let message: RendererToMainMessage;
-      try {
-        message = JSON.parse(String(rawData)) as RendererToMainMessage;
-      } catch (error) {
-        console.error("[ipc-bridge] invalid JSON payload", error);
-        return;
-      }
-
-      if (message.type === "ipc-renderer-send") {
-        bridgeState.handleRendererSend?.(message.channel, message.args);
-        return;
-      }
-
-      if (message.type === "workspace-directory-entries-request") {
-        const { requestId } = message;
-        getWorkspaceDirectoryEntries(message)
-          .then((result) => {
-            const payload: MainToRendererMessage = {
-              type: "workspace-directory-entries-result",
-              requestId,
-              ok: true,
-              result,
-            };
-            if (socket.readyState === WebSocket.OPEN) {
-              socket.send(JSON.stringify(payload));
-            }
-          })
-          .catch((error) => {
-            const payload: MainToRendererMessage = {
-              type: "workspace-directory-entries-result",
-              requestId,
-              ok: false,
-              errorMessage: errorMessage(error),
-            };
-            if (socket.readyState === WebSocket.OPEN) {
-              socket.send(JSON.stringify(payload));
-            }
-          });
-        return;
-      }
-
-      if (message.type === "ipc-renderer-invoke") {
-        const { channel, requestId, args } = message;
-        Promise.resolve(
-          bridgeState.handleRendererInvoke?.(channel, args) ??
-            Promise.reject(
-              new Error(
-                `[ipc-bridge] no ipcMain.handle for channel ${channel}`,
-              ),
-            ),
-        )
-          .then((result) => {
-            const payload: MainToRendererMessage = {
-              type: "ipc-renderer-invoke-result",
-              requestId,
-              ok: true,
-              result,
-            };
-            if (socket.readyState === WebSocket.OPEN) {
-              socket.send(JSON.stringify(payload));
-            }
-          })
-          .catch((error) => {
-            const payload: MainToRendererMessage = {
-              type: "ipc-renderer-invoke-result",
-              requestId,
-              ok: false,
-              errorMessage: errorMessage(error),
-            };
-            if (socket.readyState === WebSocket.OPEN) {
-              socket.send(JSON.stringify(payload));
-            }
-          });
-      }
-    });
+  const server = Bun.serve({
+    hostname: options.host,
+    port: options.port,
+    fetch: app.fetch,
+    websocket,
+    maxRequestBodySize: MAX_REQUEST_BODY_SIZE,
   });
 
-  await app.listen({ host: options.host, port: options.port });
   console.log(`IPC bridge listening at ws://${options.host}:${options.port}`);
 
+  let stopping = false;
+  const stopServer = async (): Promise<void> => {
+    if (stopping) {
+      return;
+    }
+    stopping = true;
+    bridgeState.broadcastToRenderer = undefined;
+    for (const socket of sockets.values()) {
+      socket.close(1001, "server shutting down");
+    }
+    sockets.clear();
+    await server.stop(true);
+    await fs.rm(uploadRoot, { recursive: true, force: true });
+  };
+
+  process.once("SIGINT", () => {
+    void stopServer().finally(() => process.exit(0));
+  });
+  process.once("SIGTERM", () => {
+    void stopServer().finally(() => process.exit(0));
+  });
+
   ensureElectronLikeProcessContext();
-  installModuleAliasHook();
 
   const packageJson = JSON.parse(
     await fs.readFile(

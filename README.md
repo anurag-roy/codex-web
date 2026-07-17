@@ -26,17 +26,20 @@ default, it listens on `127.0.0.1:8214`.
 it will use `codex` from `PATH` if available, or `CODEX_CLI_PATH` if you set
 it.
 
-run it with `npx`:
+install [Bun](https://bun.sh/), then clone and start the server:
 
 ```bash
-npx --yes github:0xcaff/codex-web
+git clone https://github.com/0xcaff/codex-web.git
+cd codex-web
+bun install
+bun run server
 ```
 
-or with nix:
+the first install or server start downloads and prepares the Codex Desktop
+assets under `scratch/`. subsequent starts reuse those assets and rebuild the
+local server and browser bridge.
 
-```bash
-nix run github:0xcaff/codex-web
-```
+the existing nix files are legacy and are not part of the bun migration.
 
 then open <http://127.0.0.1:8214> in a browser.
 
@@ -101,7 +104,7 @@ someone with access to the web ui may be able to:
 
 ## features
 
-- hostable on macOS, Linux (and anything codex cli + node will run on)
+- hostable on macOS, Linux (and anything codex cli + bun will run on)
 - reachable from the browser
 - thin wrapper, so updates should land fast
 - working today:

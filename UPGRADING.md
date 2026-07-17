@@ -10,7 +10,7 @@ get the `scratch` directory to a known state by running the following
 
 ```bash
 rm -rf scratch scratch-backup # remove existing past scratch directories to start from clean state
-DEV=1 nix develop --command yarn run prepare:asar 
+DEV=1 bun run prepare:asar
 mv scratch scratch-backup
 ```
 
@@ -28,7 +28,7 @@ there are a few places to update next.
 then temporarily comment out the patch lines in ./scripts/prepare_asar and run
 
 ```bash
-DEV=1 nix develop --command yarn run prepare:asar 
+DEV=1 bun run prepare:asar
 cp -r scratch scratch-new-version-unmodified
 ```
 
@@ -70,7 +70,7 @@ once that is done, uncomment the patch lines in `scripts/prepare_asar` and run
 ```bash
 mv scratch scratch-patched-inplace
 rm -rf scratch
-DEV=1 nix develop --command yarn run prepare:asar 
+DEV=1 bun run prepare:asar
 ```
 
 then diff `./scratch-patched-inplace` with the resulting `./scratch` to validate
@@ -85,7 +85,7 @@ client. before starting this step, make sure to wait for the
 to validate the server, run the following
 
 ```bash
-nix develop --command yarn server
+bun run server
 ```
 
 next validate the client by opening a browser window to `http://localhost:8214`

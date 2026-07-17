@@ -52,12 +52,14 @@ for connecting the in memory router to the browser history and setting up the
 sidebar behavior on mobile.
 
 the ipc websocket is hosted by [main.ts](./src/server/main.ts). this process
-binds a port and listens for incoming websocket connections. it also shims
-electron (see `installModuleAliasHook`) before loading the electron shell
-entrypoint. the shims are located in
-[./src/server/electron](./src/server/electron) and focus on providing the
-minimum amount of functionality needed to make the app work. this comes down to
-some network transport to the outside world and hooking up to the ipc pipe from
+uses hono on bun to serve the webview, accept browser file uploads, and listen
+for incoming websocket connections. before loading the electron shell
+entrypoint, the preparation scripts install runtime shims for electron and
+better-sqlite3. the electron shim is located in
+[./src/server/electron](./src/server/electron), while the sqlite shim maps the
+small synchronous database API used by the desktop bundle to `bun:sqlite`.
+these shims focus on the minimum functionality needed to make the app work.
+this comes down to some network transport and hooking up to the ipc pipe from
 the renderer. this part is the most sloppy part of the codebase as i left codex
 to figure it out unattended. the parts around `__codexElectronIpcBridge` are the
 important bits related to wiring up the ipc bridge.

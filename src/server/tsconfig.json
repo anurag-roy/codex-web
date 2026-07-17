@@ -9,11 +9,9 @@
     // See also https://aka.ms/tsconfig/module
     "module": "nodenext",
     "target": "esnext",
-    "types": [],
-    // For nodejs:
-    // "lib": ["esnext"],
-    // "types": ["node"],
-    // and npm install -D @types/node
+    "lib": ["esnext", "dom", "dom.iterable"],
+    "types": ["bun"],
+    // Bun provides the Web APIs plus Node.js compatibility types used here.
 
     // Other Outputs
     "sourceMap": true,
@@ -39,6 +37,6 @@
     "isolatedModules": true,
     "noUncheckedSideEffectImports": true,
     "moduleDetection": "force",
-    "skipLibCheck": true,
+    "skipLibCheck": true
   }
 }

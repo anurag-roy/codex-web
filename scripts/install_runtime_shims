@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+electron_shim_dir="scratch/asar/node_modules/electron"
+sqlite_shim_dir="scratch/asar/node_modules/better-sqlite3"
+
+mkdir -p "$electron_shim_dir" "$sqlite_shim_dir"
+cp src/server/electron/loader.cjs "$electron_shim_dir/index.js"
+cp src/server/sqlite/loader.cjs "$sqlite_shim_dir/index.js"
