@@ -1,5 +1,11 @@
 type StubFunction = (...args: unknown[]) => unknown;
 type StubListener = (...args: unknown[]) => void;
+type StubMessagePort = {
+  close: () => void;
+  on: (event: string, listener: StubListener) => unknown;
+  postMessage: (message: unknown) => void;
+  start: () => void;
+};
 type StubWebContents = {
   id: number;
   mainFrame: {
@@ -21,6 +27,7 @@ type IpcMainEvent = {
   senderFrame: {
     url: string;
   };
+  ports: StubMessagePort[];
   reply: (channel: string, ...args: unknown[]) => void;
 };
 
@@ -35,6 +42,12 @@ type IpcMainBridgeState = {
     args: unknown[],
     sourceUrl?: string,
   ) => Promise<unknown>;
+  handleRendererPostMessage?: (
+    channel: string,
+    message: unknown,
+    ports: StubMessagePort[],
+    sourceUrl?: string,
+  ) => void;
   handleRendererSend?: (
     channel: string,
     args: unknown[],
@@ -176,13 +189,18 @@ const rendererWebContents: StubWebContents = {
   },
 };
 
-function createIpcMainEvent(): IpcMainEvent {
+function createIpcMainEvent(ports: StubMessagePort[] = []): IpcMainEvent {
+  const sender =
+    (BrowserWindow.fromWebContents(rendererWebContents)
+      ?.webContents as unknown as StubWebContents | undefined) ??
+    rendererWebContents;
   const event: IpcMainEvent = {
     returnValue: undefined,
     processId: 1,
     frameId: 1,
-    sender: rendererWebContents,
-    senderFrame: rendererMainFrame,
+    sender,
+    senderFrame: sender.mainFrame,
+    ports,
     reply: (channel: string, ...args: unknown[]): void => {
       getIpcMainBridgeState().broadcastToRenderer?.({
         type: "ipc-main-event",
@@ -211,6 +229,26 @@ function createIpcMainStub(): {
   >();
   const bridgeState = getIpcMainBridgeState();
 
+  const pendingPostMessages = new Map<
+    string,
+    Array<{ message: unknown; ports: StubMessagePort[] }>
+  >();
+  const registeredPostMessageChannels = new Set<string>();
+
+  bridgeState.handleRendererPostMessage = (
+    channel: string,
+    message: unknown,
+    ports: StubMessagePort[],
+  ): void => {
+    if (registeredPostMessageChannels.has(channel)) {
+      emitter.emit(channel, createIpcMainEvent(ports), message);
+      return;
+    }
+    const pending = pendingPostMessages.get(channel) ?? [];
+    pending.push({ message, ports });
+    pendingPostMessages.set(channel, pending);
+  };
+
   bridgeState.handleRendererInvoke = async (
     channel: string,
     args: unknown[],
@@ -233,7 +271,18 @@ function createIpcMainStub(): {
   };
 
   return {
-    on: emitter.on,
+    on(channel: string, listener: StubListener): unknown {
+      const result = emitter.on(channel, listener);
+      registeredPostMessageChannels.add(channel);
+      const pending = pendingPostMessages.get(channel);
+      if (pending) {
+        pendingPostMessages.delete(channel);
+        for (const { message, ports } of pending) {
+          emitter.emit(channel, createIpcMainEvent(ports), message);
+        }
+      }
+      return result;
+    },
     off: emitter.off,
     handle(
       channel: string,
@@ -391,8 +440,8 @@ class BrowserWindow {
         getURL: (): string => {
           log(`BrowserWindow#${this.id}.webContents.getURL`, []);
           return String(
-            (this.webContents.mainFrame as { url?: string } | undefined)
-              ?.url ?? "",
+            (this.webContents.mainFrame as { url?: string } | undefined)?.url ??
+              "",
           );
         },
         isDestroyed: (): boolean => this.destroyed,
@@ -453,10 +502,7 @@ class BrowserWindow {
 
   static getFocusedWindow(): BrowserWindow | null {
     log("BrowserWindow.getFocusedWindow", []);
-    if (
-      BrowserWindow.focusedWindow &&
-      !BrowserWindow.focusedWindow.destroyed
-    ) {
+    if (BrowserWindow.focusedWindow && !BrowserWindow.focusedWindow.destroyed) {
       return BrowserWindow.focusedWindow;
     }
     return BrowserWindow.getAllWindows()[0] ?? null;
@@ -493,6 +539,11 @@ class BrowserWindow {
 
   removeListener(event: string, listener: StubListener): unknown {
     return this.emitter.removeListener(event, listener);
+  }
+
+  async loadURL(url: string): Promise<void> {
+    log(`BrowserWindow#${this.id}.loadURL`, [url]);
+    (this.webContents.mainFrame as { url: string }).url = url;
   }
 
   close(): void {
@@ -819,6 +870,15 @@ const protocol = {
   },
 };
 function createSessionStub(label: string): {
+  cookies: {
+    get: (...args: unknown[]) => Promise<unknown[]>;
+    off: (event: string, listener: StubListener) => unknown;
+    on: (event: string, listener: StubListener) => unknown;
+    once: (event: string, listener: StubListener) => unknown;
+    remove: (...args: unknown[]) => Promise<void>;
+    removeListener: (event: string, listener: StubListener) => unknown;
+    set: (...args: unknown[]) => Promise<void>;
+  };
   getUserAgent: () => string;
   loadExtension: (extensionPath: string) => Promise<{
     id: string;
@@ -839,7 +899,24 @@ function createSessionStub(label: string): {
   };
 } {
   const emitter = createEmitterStub(label);
+  const cookiesEmitter = createEmitterStub(`${label}.cookies`);
   return {
+    cookies: {
+      async get(...args: unknown[]): Promise<unknown[]> {
+        log(`${label}.cookies.get`, args);
+        return [];
+      },
+      off: cookiesEmitter.off,
+      on: cookiesEmitter.on,
+      once: cookiesEmitter.once,
+      async remove(...args: unknown[]): Promise<void> {
+        log(`${label}.cookies.remove`, args);
+      },
+      removeListener: cookiesEmitter.removeListener,
+      async set(...args: unknown[]): Promise<void> {
+        log(`${label}.cookies.set`, args);
+      },
+    },
     async loadExtension(extensionPath: string): Promise<{
       id: string;
       name: string;
@@ -879,14 +956,19 @@ function createSessionStub(label: string): {
     },
   };
 }
-const partitionSessions = new Map<string, ReturnType<typeof createSessionStub>>();
+const partitionSessions = new Map<
+  string,
+  ReturnType<typeof createSessionStub>
+>();
 const session = {
   defaultSession: createSessionStub("session.defaultSession"),
   fromPartition(partition: string): ReturnType<typeof createSessionStub> {
     log("session.fromPartition", [partition]);
     let partitionSession = partitionSessions.get(partition);
     if (!partitionSession) {
-      partitionSession = createSessionStub(`session.fromPartition(${partition})`);
+      partitionSession = createSessionStub(
+        `session.fromPartition(${partition})`,
+      );
       partitionSessions.set(partition, partitionSession);
     }
     return partitionSession;

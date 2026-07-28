@@ -48,6 +48,26 @@ type ServerEnvironment = {
   };
 };
 
+function cacheControlForWebviewFile(filePath: string): string {
+  const filename = path.basename(filePath);
+  const isAsset = path.basename(path.dirname(filePath)) === "assets";
+  const hasContentHash = [
+    /-[A-Za-z0-9_-]{8}\.[A-Za-z0-9]+$/,
+    /\.[a-z0-9]{10}\.[A-Za-z0-9]+$/,
+  ].some((pattern) => pattern.test(filename));
+
+  return isAsset &&
+    !new Set([
+      "dotnet.js",
+      "preload.js",
+      "preload.js.map",
+      "pwa-icon-512.png",
+    ]).has(filename) &&
+    hasContentHash
+    ? "public, max-age=31536000, immutable"
+    : "public, max-age=0";
+}
+
 type RendererToMainMessage =
   | {
       type: "ipc-renderer-invoke";
@@ -61,6 +81,22 @@ type RendererToMainMessage =
       channel: string;
       args: unknown[];
       sourceUrl: string;
+    }
+  | {
+      type: "ipc-renderer-post-message";
+      channel: string;
+      message: unknown;
+      portIds: string[];
+      sourceUrl?: string;
+    }
+  | {
+      type: "message-port-message";
+      portId: string;
+      data: unknown;
+    }
+  | {
+      type: "message-port-close";
+      portId: string;
     }
   | {
       type: "workspace-directory-entries-request";
@@ -98,6 +134,15 @@ type MainToRendererMessage =
       requestId: string;
       ok: false;
       errorMessage: string;
+    }
+  | {
+      type: "message-port-message";
+      portId: string;
+      data: unknown;
+    }
+  | {
+      type: "message-port-close";
+      portId: string;
     };
 
 type WorkspaceDirectoryEntry = {
@@ -111,6 +156,92 @@ type WorkspaceDirectoryEntries = {
   parentPath: string | null;
   entries: WorkspaceDirectoryEntry[];
 };
+
+type MessagePortListener = (...args: unknown[]) => void;
+
+type BridgedMessagePort = {
+  close: () => void;
+  on: (event: string, listener: MessagePortListener) => unknown;
+  postMessage: (message: unknown) => void;
+  start: () => void;
+};
+
+class WebSocketMessagePort implements BridgedMessagePort {
+  private closed = false;
+  private readonly listeners = new Map<string, Set<MessagePortListener>>();
+
+  constructor(
+    private readonly portId: string,
+    private readonly sendToRenderer: (message: MainToRendererMessage) => void,
+    private readonly onClosed: () => void,
+  ) {}
+
+  on(event: string, listener: MessagePortListener): this {
+    const listeners = this.listeners.get(event) ?? new Set();
+    listeners.add(listener);
+    this.listeners.set(event, listeners);
+
+    return this;
+  }
+
+  postMessage(data: unknown): void {
+    if (this.closed) {
+      return;
+    }
+    this.sendToRenderer({
+      type: "message-port-message",
+      portId: this.portId,
+      data,
+    });
+  }
+
+  start(): void {}
+
+  close(): void {
+    if (!this.markClosed()) {
+      return;
+    }
+    this.sendToRenderer({
+      type: "message-port-close",
+      portId: this.portId,
+    });
+  }
+
+  receiveMessage(data: unknown): void {
+    if (this.closed) {
+      return;
+    }
+    const listeners = this.listeners.get("message");
+    if (!listeners || listeners.size === 0) {
+      return;
+    }
+    for (const listener of listeners) {
+      listener({ data });
+    }
+  }
+
+  disconnect(): void {
+    if (!this.markClosed()) {
+      return;
+    }
+    this.emit("close");
+  }
+
+  private emit(event: string, ...args: unknown[]): void {
+    for (const listener of this.listeners.get(event) ?? []) {
+      listener(...args);
+    }
+  }
+
+  private markClosed(): boolean {
+    if (this.closed) {
+      return false;
+    }
+    this.closed = true;
+    this.onClosed();
+    return true;
+  }
+}
 
 function workspaceDirectoryEntryTypeRank(
   entry: WorkspaceDirectoryEntry,
@@ -140,7 +271,20 @@ function compareWorkspaceDirectoryEntries(
 type IpcMainBridgeState = {
   broadcastToRenderer?: (message: MainToRendererMessage) => void;
   handleRendererInvoke?: (channel: string, args: unknown[]) => Promise<unknown>;
+  handleRendererPostMessage?: (
+    channel: string,
+    message: unknown,
+    ports: BridgedMessagePort[],
+    sourceUrl?: string,
+  ) => void;
   handleRendererSend?: (channel: string, args: unknown[]) => void;
+};
+
+type SocketConnection = {
+  authCookie: string | null;
+  messagePorts: Map<string, WebSocketMessagePort>;
+  revalidationTimer: ReturnType<typeof setTimeout> | null;
+  socket: WSContext;
 };
 
 const OPEN_WEBSOCKET_READY_STATE = 1;
@@ -299,6 +443,8 @@ async function getWorkspaceDirectoryEntries({
 }
 
 function ensureElectronLikeProcessContext(): void {
+  process.env.BUILD_FLAVOR = "prod";
+
   const versions = process.versions as NodeJS.ProcessVersions & {
     electron?: string;
   };
@@ -329,14 +475,7 @@ function ensureElectronLikeProcessContext(): void {
 async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
   const bridgeState = getIpcMainBridgeState();
   const app = new Hono<ServerEnvironment>();
-  const sockets = new Map<
-    unknown,
-    {
-      authCookie: string | null;
-      revalidationTimer: ReturnType<typeof setTimeout> | null;
-      socket: WSContext;
-    }
-  >();
+  const sockets = new Map<unknown, SocketConnection>();
 
   const uploadRoot = await fs.mkdtemp(
     path.join(os.tmpdir(), "codex-web-uploads-"),
@@ -449,6 +588,13 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
     await next();
   }
 
+  function clearSocketMessagePorts(connection: SocketConnection): void {
+    for (const port of connection.messagePorts.values()) {
+      port.disconnect();
+    }
+    connection.messagePorts.clear();
+  }
+
   function clearSocketRevalidation(rawSocket: unknown): void {
     const connection = sockets.get(rawSocket);
     if (connection?.revalidationTimer) {
@@ -482,6 +628,26 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
         scheduleSocketRevalidation(rawSocket);
       });
     }, SESSION_REVALIDATION_INTERVAL_MS);
+  }
+
+  function dispatchPostMessage(
+    channel: string,
+    message: unknown,
+    ports: WebSocketMessagePort[],
+    sourceUrl?: string,
+  ): void {
+    const handler = bridgeState.handleRendererPostMessage;
+    if (handler) {
+      handler(channel, message, ports, sourceUrl);
+      return;
+    }
+
+    console.error(
+      `[ipc-bridge] no ipcMain postMessage handler for channel ${channel}`,
+    );
+    for (const port of ports) {
+      port.close();
+    }
   }
 
   app.use("/__backend/*", requireCentralAuthApi);
@@ -543,20 +709,34 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
         onOpen(_event, socket) {
           sockets.set(socket.raw, {
             authCookie,
+            messagePorts: new Map(),
             revalidationTimer: null,
             socket,
           });
           scheduleSocketRevalidation(socket.raw);
         },
         onClose(_event, socket) {
+          const connection = sockets.get(socket.raw);
+          if (connection) {
+            clearSocketMessagePorts(connection);
+          }
           clearSocketRevalidation(socket.raw);
           sockets.delete(socket.raw);
         },
         onError(_event, socket) {
+          const connection = sockets.get(socket.raw);
+          if (connection) {
+            clearSocketMessagePorts(connection);
+          }
           clearSocketRevalidation(socket.raw);
           sockets.delete(socket.raw);
         },
         async onMessage(event, socket) {
+          const connection = sockets.get(socket.raw);
+          if (!connection) {
+            return;
+          }
+
           let message: RendererToMainMessage;
           try {
             message = JSON.parse(
@@ -569,6 +749,51 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
 
           if (message.type === "ipc-renderer-send") {
             bridgeState.handleRendererSend?.(message.channel, message.args);
+            return;
+          }
+
+          if (message.type === "ipc-renderer-post-message") {
+            if (new Set(message.portIds).size !== message.portIds.length) {
+              console.error(
+                "[ipc-bridge] duplicate transferred MessagePort id",
+              );
+              return;
+            }
+
+            const ports = message.portIds.map((portId) => {
+              const existingPort = connection.messagePorts.get(portId);
+              if (existingPort) {
+                existingPort.disconnect();
+              }
+              const port = new WebSocketMessagePort(
+                portId,
+                (payload) => {
+                  sendWebSocketMessage(socket, payload);
+                },
+                () => connection.messagePorts.delete(portId),
+              );
+              connection.messagePorts.set(portId, port);
+              return port;
+            });
+
+            dispatchPostMessage(
+              message.channel,
+              message.message,
+              ports,
+              message.sourceUrl,
+            );
+            return;
+          }
+
+          if (message.type === "message-port-message") {
+            connection.messagePorts
+              .get(message.portId)
+              ?.receiveMessage(message.data);
+            return;
+          }
+
+          if (message.type === "message-port-close") {
+            connection.messagePorts.get(message.portId)?.disconnect();
             return;
           }
 
@@ -636,7 +861,15 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
 
   app.all("/@fs/*", (context) => context.json({ error: "Not Found" }, 404));
 
-  app.use("/*", serveStatic({ root: webviewRoot }));
+  app.use(
+    "/*",
+    serveStatic({
+      root: webviewRoot,
+      onFound: (filePath, context) => {
+        context.header("Cache-Control", cacheControlForWebviewFile(filePath));
+      },
+    }),
+  );
   app.get("*", serveStatic({ root: webviewRoot, path: "index.html" }));
 
   app.notFound((context) => {
@@ -680,6 +913,7 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
     stopping = true;
     bridgeState.broadcastToRenderer = undefined;
     for (const [rawSocket, connection] of sockets) {
+      clearSocketMessagePorts(connection);
       clearSocketRevalidation(rawSocket);
       connection.socket.close(1001, "server shutting down");
     }
