@@ -32,7 +32,7 @@ install [Bun](https://bun.sh/), then clone and start the server:
 git clone https://github.com/0xcaff/codex-web.git
 cd codex-web
 bun install
-bun run server
+bun run server:local
 ```
 
 the first install or server start downloads and prepares the Codex Desktop
@@ -41,7 +41,33 @@ local server and browser bridge.
 
 the existing nix files are legacy and are not part of the bun migration.
 
-then open <http://127.0.0.1:8214> in a browser.
+then open <http://127.0.0.1:8214> in a browser. `server:local` disables central
+authentication and is deliberately restricted to a loopback bind.
+
+### hosted access
+
+The normal `bun run server` command protects the app with the central passkey
+service at <https://auth.anuragroy.dev>. It is intended to be reverse-proxied
+over HTTPS at <https://codex.anuragroy.dev> or
+<https://local.anuragroy.dev>.
+
+The app forwards the incoming shared-domain cookie to the central session
+endpoint. It does not store passkeys, auth tables, passwords, or Better Auth
+secrets locally. Unauthenticated page requests render a local login screen; its
+passkey button navigates to the central sign-in page. File access, uploads, and
+the IPC WebSocket return an unauthorized response instead, and the WebSocket
+only accepts the exact origin used to reach the app. The web manifest and static
+frontend assets remain public so browser subresource requests are never
+redirected to the login UI.
+
+By default, the two origins above are allowed. Override them with a
+comma-separated list when needed:
+
+```bash
+CODEX_WEB_ORIGINS=https://codex.anuragroy.dev bun run server
+```
+
+Do not expose `server:local` through a reverse proxy or tunnel.
 
 ### sign in
 
@@ -84,13 +110,11 @@ rather than opening an interactive prompt.
 
 ## security
 
-run `codex-web` only on trusted networks. treat anyone who can reach the
-`codex-web` server as someone who can operate codex on the host machine as the
-same user running the server.
-
-if you need authn or authz, implement it outside of `codex-web`: proxy it through
-wireguard, tailscale, or an ssh tunnel and put an authentication gateway or
-reverse proxy in front.
+Central passkey authentication is enabled by default, but it should not be the
+only security boundary. Keep the Bun server bound to loopback, terminate HTTPS
+at the reverse proxy, and use a trusted network, WireGuard, or Tailscale when
+possible. Treat the authenticated owner as someone who can operate codex on the
+host machine as the same user running the server.
 
 someone with access to the web ui may be able to:
 

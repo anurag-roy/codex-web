@@ -12,6 +12,8 @@ const node_util_1 = require("node:util");
 const hono_1 = require("hono");
 const bun_1 = require("hono/bun");
 const glob_1 = require("glob");
+const central_auth_js_1 = require("./central-auth.js");
+const login_page_js_1 = require("./login-page.js");
 function workspaceDirectoryEntryTypeRank(entry) {
     return entry.type === "directory" ? 0 : 1;
 }
@@ -27,10 +29,12 @@ function compareWorkspaceDirectoryEntries(left, right) {
 }
 const OPEN_WEBSOCKET_READY_STATE = 1;
 const MAX_REQUEST_BODY_SIZE = 1024 ** 4;
+const SESSION_REVALIDATION_INTERVAL_MS = 30_000;
+const UNAUTHORIZED_WEBSOCKET_CLOSE_CODE = 4401;
 function printUsage() {
     console.log([
         "Usage:",
-        "  server [--host <host>] [--port <port>]",
+        "  server [--host <host>] [--port <port>] [--unsafe-disable-auth]",
         "",
         "Defaults:",
         "  --host 127.0.0.1",
@@ -39,6 +43,7 @@ function printUsage() {
         "Examples:",
         "  bun run server",
         "  bun run server --port 9000",
+        "  bun run server:local",
     ].join("\n"));
 }
 function parsePort(raw) {
@@ -63,6 +68,9 @@ function parseServerArgs(args) {
             port: {
                 type: "string",
             },
+            "unsafe-disable-auth": {
+                type: "boolean",
+            },
         },
         strict: true,
     });
@@ -70,10 +78,19 @@ function parseServerArgs(args) {
         printUsage();
         process.exit(0);
     }
+    const host = parsed.values.host ?? "127.0.0.1";
+    const authEnabled = !parsed.values["unsafe-disable-auth"];
+    if (!authEnabled && !isLoopbackHost(host)) {
+        throw new Error("--unsafe-disable-auth can only be used on a loopback host");
+    }
     return {
-        host: parsed.values.host ?? "127.0.0.1",
+        authEnabled,
+        host,
         port: parsed.values.port ? parsePort(parsed.values.port) : 8214,
     };
+}
+function isLoopbackHost(host) {
+    return host === "127.0.0.1" || host === "::1" || host === "localhost";
 }
 function getIpcMainBridgeState() {
     const globals = globalThis;
@@ -155,6 +172,113 @@ async function startIpcBridgeServer(options) {
     const sockets = new Map();
     const uploadRoot = await promises_1.default.mkdtemp(node_path_1.default.join(node_os_1.default.tmpdir(), "codex-web-uploads-"));
     const webviewRoot = node_path_1.default.resolve(__dirname, "../../scratch/asar/webview");
+    const allowedAppOrigins = (0, central_auth_js_1.getCodexWebOrigins)();
+    function getRequestAppOrigin(context) {
+        return (0, central_auth_js_1.resolveCodexWebOrigin)(context.req.url, context.req.header("x-forwarded-host") ?? context.req.header("host"), allowedAppOrigins);
+    }
+    async function authenticateRequest(context) {
+        if (!options.authEnabled) {
+            return { enabled: false };
+        }
+        const cookie = context.req.header("cookie") ?? "";
+        const session = await (0, central_auth_js_1.getCentralAuthSession)(cookie);
+        if (!session) {
+            return null;
+        }
+        return { enabled: true, cookie, session };
+    }
+    async function requireCentralAuthApi(context, next) {
+        context.header("cache-control", "private, no-store");
+        context.header("vary", "Cookie");
+        const auth = await authenticateRequest(context);
+        if (!auth) {
+            const appOrigin = getRequestAppOrigin(context);
+            return context.json({
+                error: "Unauthorized",
+                loginUrl: (0, central_auth_js_1.getCentralAuthLoginUrl)(appOrigin, appOrigin),
+            }, 401);
+        }
+        context.set("centralAuth", auth);
+        await next();
+    }
+    async function requireCentralAuthPage(context, next) {
+        const auth = await authenticateRequest(context);
+        if (!auth) {
+            const appOrigin = getRequestAppOrigin(context);
+            context.header("cache-control", "private, no-store");
+            context.header("content-security-policy", "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
+            context.header("referrer-policy", "no-referrer");
+            context.header("vary", "Cookie");
+            context.header("x-content-type-options", "nosniff");
+            return context.html((0, login_page_js_1.renderLoginPage)((0, central_auth_js_1.getCentralAuthLoginUrl)(context.req.url, appOrigin)));
+        }
+        context.set("centralAuth", auth);
+        context.header("cache-control", "private, no-store");
+        context.header("vary", "Cookie");
+        await next();
+    }
+    async function requireCodexWebOrigin(context, next) {
+        const auth = context.get("centralAuth");
+        if (auth.enabled &&
+            !(0, central_auth_js_1.isCodexWebOrigin)(context.req.header("origin"), getRequestAppOrigin(context))) {
+            return context.json({ error: "Forbidden" }, 403);
+        }
+        await next();
+    }
+    async function requireCodexWebRequestSource(context, next) {
+        const auth = context.get("centralAuth");
+        const appOrigin = getRequestAppOrigin(context);
+        if (auth.enabled &&
+            !(0, central_auth_js_1.isCodexWebOrigin)(context.req.header("origin"), appOrigin) &&
+            !(0, central_auth_js_1.isCodexWebOrigin)(context.req.header("referer"), appOrigin)) {
+            return context.json({ error: "Forbidden" }, 403);
+        }
+        await next();
+    }
+    function clearSocketRevalidation(rawSocket) {
+        const connection = sockets.get(rawSocket);
+        if (connection?.revalidationTimer) {
+            clearTimeout(connection.revalidationTimer);
+            connection.revalidationTimer = null;
+        }
+    }
+    function scheduleSocketRevalidation(rawSocket) {
+        const connection = sockets.get(rawSocket);
+        if (!connection?.authCookie) {
+            return;
+        }
+        connection.revalidationTimer = setTimeout(() => {
+            void (0, central_auth_js_1.getCentralAuthSession)(connection.authCookie).then((session) => {
+                const currentConnection = sockets.get(rawSocket);
+                if (currentConnection !== connection) {
+                    return;
+                }
+                connection.revalidationTimer = null;
+                if (!session) {
+                    connection.socket.close(UNAUTHORIZED_WEBSOCKET_CLOSE_CODE, "authentication expired");
+                    return;
+                }
+                scheduleSocketRevalidation(rawSocket);
+            });
+        }, SESSION_REVALIDATION_INTERVAL_MS);
+    }
+    app.use("/__backend/*", requireCentralAuthApi);
+    app.use("/@fs/*", requireCentralAuthApi);
+    app.use("/@fs/*", requireCodexWebRequestSource);
+    app.use("/__backend/upload", requireCodexWebOrigin);
+    app.use("/__backend/ipc", requireCodexWebOrigin);
+    app.use("*", async (context, next) => {
+        const requestPath = context.req.path;
+        if (requestPath.startsWith("/__backend/") ||
+            requestPath.startsWith("/@fs/") ||
+            requestPath.startsWith("/assets/") ||
+            requestPath === "/favicon.svg" ||
+            requestPath === "/manifest.json") {
+            await next();
+            return;
+        }
+        return requireCentralAuthPage(context, next);
+    });
     app.post("/__backend/upload", async (context) => {
         const contentType = context.req.header("content-type")?.toLowerCase();
         if (!contentType?.startsWith("multipart/form-data")) {
@@ -178,73 +302,84 @@ async function startIpcBridgeServer(options) {
         }
         return context.json({ files });
     });
-    app.get("/__backend/ipc", (0, bun_1.upgradeWebSocket)(() => ({
-        onOpen(_event, socket) {
-            sockets.set(socket.raw, socket);
-        },
-        onClose(_event, socket) {
-            sockets.delete(socket.raw);
-        },
-        onError(_event, socket) {
-            sockets.delete(socket.raw);
-        },
-        async onMessage(event, socket) {
-            let message;
-            try {
-                message = JSON.parse(await websocketMessageText(event.data));
-            }
-            catch (error) {
-                console.error("[ipc-bridge] invalid JSON payload", error);
-                return;
-            }
-            if (message.type === "ipc-renderer-send") {
-                bridgeState.handleRendererSend?.(message.channel, message.args);
-                return;
-            }
-            if (message.type === "workspace-directory-entries-request") {
-                const { requestId } = message;
-                getWorkspaceDirectoryEntries(message)
-                    .then((result) => {
-                    sendWebSocketMessage(socket, {
-                        type: "workspace-directory-entries-result",
-                        requestId,
-                        ok: true,
-                        result,
-                    });
-                })
-                    .catch((error) => {
-                    sendWebSocketMessage(socket, {
-                        type: "workspace-directory-entries-result",
-                        requestId,
-                        ok: false,
-                        errorMessage: errorMessage(error),
-                    });
+    app.get("/__backend/ipc", (0, bun_1.upgradeWebSocket)((context) => {
+        const auth = context.get("centralAuth");
+        const authCookie = auth.enabled ? auth.cookie : null;
+        return {
+            onOpen(_event, socket) {
+                sockets.set(socket.raw, {
+                    authCookie,
+                    revalidationTimer: null,
+                    socket,
                 });
-                return;
-            }
-            if (message.type === "ipc-renderer-invoke") {
-                const { channel, requestId, args } = message;
-                Promise.resolve(bridgeState.handleRendererInvoke?.(channel, args) ??
-                    Promise.reject(new Error(`[ipc-bridge] no ipcMain.handle for channel ${channel}`)))
-                    .then((result) => {
-                    sendWebSocketMessage(socket, {
-                        type: "ipc-renderer-invoke-result",
-                        requestId,
-                        ok: true,
-                        result,
+                scheduleSocketRevalidation(socket.raw);
+            },
+            onClose(_event, socket) {
+                clearSocketRevalidation(socket.raw);
+                sockets.delete(socket.raw);
+            },
+            onError(_event, socket) {
+                clearSocketRevalidation(socket.raw);
+                sockets.delete(socket.raw);
+            },
+            async onMessage(event, socket) {
+                let message;
+                try {
+                    message = JSON.parse(await websocketMessageText(event.data));
+                }
+                catch (error) {
+                    console.error("[ipc-bridge] invalid JSON payload", error);
+                    return;
+                }
+                if (message.type === "ipc-renderer-send") {
+                    bridgeState.handleRendererSend?.(message.channel, message.args);
+                    return;
+                }
+                if (message.type === "workspace-directory-entries-request") {
+                    const { requestId } = message;
+                    getWorkspaceDirectoryEntries(message)
+                        .then((result) => {
+                        sendWebSocketMessage(socket, {
+                            type: "workspace-directory-entries-result",
+                            requestId,
+                            ok: true,
+                            result,
+                        });
+                    })
+                        .catch((error) => {
+                        sendWebSocketMessage(socket, {
+                            type: "workspace-directory-entries-result",
+                            requestId,
+                            ok: false,
+                            errorMessage: errorMessage(error),
+                        });
                     });
-                })
-                    .catch((error) => {
-                    sendWebSocketMessage(socket, {
-                        type: "ipc-renderer-invoke-result",
-                        requestId,
-                        ok: false,
-                        errorMessage: errorMessage(error),
+                    return;
+                }
+                if (message.type === "ipc-renderer-invoke") {
+                    const { channel, requestId, args } = message;
+                    Promise.resolve(bridgeState.handleRendererInvoke?.(channel, args) ??
+                        Promise.reject(new Error(`[ipc-bridge] no ipcMain.handle for channel ${channel}`)))
+                        .then((result) => {
+                        sendWebSocketMessage(socket, {
+                            type: "ipc-renderer-invoke-result",
+                            requestId,
+                            ok: true,
+                            result,
+                        });
+                    })
+                        .catch((error) => {
+                        sendWebSocketMessage(socket, {
+                            type: "ipc-renderer-invoke-result",
+                            requestId,
+                            ok: false,
+                            errorMessage: errorMessage(error),
+                        });
                     });
-                });
-            }
-        },
-    })));
+                }
+            },
+        };
+    }));
     app.use("/@fs/*", (0, bun_1.serveStatic)({
         root: "/",
         rewriteRequestPath: (requestPath) => requestPath.slice("/@fs".length),
@@ -260,8 +395,8 @@ async function startIpcBridgeServer(options) {
         return context.json({ error: "Internal Server Error" }, 500);
     });
     bridgeState.broadcastToRenderer = (message) => {
-        for (const socket of sockets.values()) {
-            sendWebSocketMessage(socket, message);
+        for (const connection of sockets.values()) {
+            sendWebSocketMessage(connection.socket, message);
         }
     };
     const server = Bun.serve({
@@ -272,6 +407,13 @@ async function startIpcBridgeServer(options) {
         maxRequestBodySize: MAX_REQUEST_BODY_SIZE,
     });
     console.log(`IPC bridge listening at ws://${options.host}:${options.port}`);
+    if (options.authEnabled) {
+        console.log(`Central authentication enabled via ${central_auth_js_1.CENTRAL_AUTH_ORIGIN}`);
+        console.log(`Allowed app origins: ${allowedAppOrigins.join(", ")}`);
+    }
+    else {
+        console.warn("WARNING: central authentication is disabled for this loopback-only server");
+    }
     let stopping = false;
     const stopServer = async () => {
         if (stopping) {
@@ -279,8 +421,9 @@ async function startIpcBridgeServer(options) {
         }
         stopping = true;
         bridgeState.broadcastToRenderer = undefined;
-        for (const socket of sockets.values()) {
-            socket.close(1001, "server shutting down");
+        for (const [rawSocket, connection] of sockets) {
+            clearSocketRevalidation(rawSocket);
+            connection.socket.close(1001, "server shutting down");
         }
         sockets.clear();
         await server.stop(true);

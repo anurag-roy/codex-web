@@ -246,7 +246,11 @@ function ensureSocket(): void {
       );
     }
   });
-  socket.addEventListener("close", () => {
+  socket.addEventListener("close", (event) => {
+    if (event.code === 4401) {
+      window.location.reload();
+      return;
+    }
     scheduleReconnect();
   });
   socket.addEventListener("error", () => {

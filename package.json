@@ -25,7 +25,9 @@
     "ensure:prepared": "(test -f scratch/asar/package.json || ./scripts/prepare) && ./scripts/install_runtime_shims",
     "prepare:asar": "./scripts/prepare_asar",
     "preserver": "bun run build",
-    "server": "CODEX_CLI_PATH=$(which codex) bun src/server/main.js"
+    "server": "CODEX_CLI_PATH=$(which codex) bun src/server/main.js",
+    "server:local": "CODEX_CLI_PATH=$(which codex) bun src/server/main.js --unsafe-disable-auth",
+    "test": "bun test tests/*.test.ts"
   },
   "repository": "git@github.com:0xcaff/codex-web.git",
   "author": "martin <martincharles07@gmail.com>",
