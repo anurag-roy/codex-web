@@ -14,6 +14,93 @@ const bun_1 = require("hono/bun");
 const glob_1 = require("glob");
 const central_auth_js_1 = require("./central-auth.js");
 const login_page_js_1 = require("./login-page.js");
+function cacheControlForWebviewFile(filePath) {
+    const filename = node_path_1.default.basename(filePath);
+    const isAsset = node_path_1.default.basename(node_path_1.default.dirname(filePath)) === "assets";
+    const hasContentHash = [
+        /-[A-Za-z0-9_-]{8}\.[A-Za-z0-9]+$/,
+        /\.[a-z0-9]{10}\.[A-Za-z0-9]+$/,
+    ].some((pattern) => pattern.test(filename));
+    return isAsset &&
+        !new Set([
+            "dotnet.js",
+            "preload.js",
+            "preload.js.map",
+            "pwa-icon-512.png",
+        ]).has(filename) &&
+        hasContentHash
+        ? "public, max-age=31536000, immutable"
+        : "public, max-age=0";
+}
+class WebSocketMessagePort {
+    portId;
+    sendToRenderer;
+    onClosed;
+    closed = false;
+    listeners = new Map();
+    constructor(portId, sendToRenderer, onClosed) {
+        this.portId = portId;
+        this.sendToRenderer = sendToRenderer;
+        this.onClosed = onClosed;
+    }
+    on(event, listener) {
+        const listeners = this.listeners.get(event) ?? new Set();
+        listeners.add(listener);
+        this.listeners.set(event, listeners);
+        return this;
+    }
+    postMessage(data) {
+        if (this.closed) {
+            return;
+        }
+        this.sendToRenderer({
+            type: "message-port-message",
+            portId: this.portId,
+            data,
+        });
+    }
+    start() { }
+    close() {
+        if (!this.markClosed()) {
+            return;
+        }
+        this.sendToRenderer({
+            type: "message-port-close",
+            portId: this.portId,
+        });
+    }
+    receiveMessage(data) {
+        if (this.closed) {
+            return;
+        }
+        const listeners = this.listeners.get("message");
+        if (!listeners || listeners.size === 0) {
+            return;
+        }
+        for (const listener of listeners) {
+            listener({ data });
+        }
+    }
+    disconnect() {
+        if (!this.markClosed()) {
+            return;
+        }
+        this.emit("close");
+    }
+    emit(event, ...args) {
+        for (const listener of this.listeners.get(event) ?? []) {
+            listener(...args);
+        }
+    }
+    markClosed() {
+        if (this.closed) {
+            return false;
+        }
+        this.closed = true;
+        this.onClosed();
+        return true;
+    }
+}
 function workspaceDirectoryEntryTypeRank(entry) {
     return entry.type === "directory" ? 0 : 1;
 }
@@ -150,6 +237,7 @@ async function getWorkspaceDirectoryEntries({ directoryPath, directoriesOnly, })
     };
 }
 function ensureElectronLikeProcessContext() {
+    process.env.BUILD_FLAVOR = "prod";
     const versions = process.versions;
     if (!versions.electron) {
         Object.defineProperty(versions, "electron", {
@@ -235,6 +323,12 @@ async function startIpcBridgeServer(options) {
         }
         await next();
     }
+    function clearSocketMessagePorts(connection) {
+        for (const port of connection.messagePorts.values()) {
+            port.disconnect();
+        }
+        connection.messagePorts.clear();
+    }
     function clearSocketRevalidation(rawSocket) {
         const connection = sockets.get(rawSocket);
         if (connection?.revalidationTimer) {
@@ -261,6 +355,17 @@ async function startIpcBridgeServer(options) {
                 scheduleSocketRevalidation(rawSocket);
             });
         }, SESSION_REVALIDATION_INTERVAL_MS);
+    }
+    function dispatchPostMessage(channel, message, ports, sourceUrl) {
+        const handler = bridgeState.handleRendererPostMessage;
+        if (handler) {
+            handler(channel, message, ports, sourceUrl);
+            return;
+        }
+        console.error(`[ipc-bridge] no ipcMain postMessage handler for channel ${channel}`);
+        for (const port of ports) {
+            port.close();
+        }
     }
     app.use("/__backend/*", requireCentralAuthApi);
     app.use("/@fs/*", requireCentralAuthApi);
@@ -309,20 +414,33 @@ async function startIpcBridgeServer(options) {
             onOpen(_event, socket) {
                 sockets.set(socket.raw, {
                     authCookie,
+                    messagePorts: new Map(),
                     revalidationTimer: null,
                     socket,
                 });
                 scheduleSocketRevalidation(socket.raw);
             },
             onClose(_event, socket) {
+                const connection = sockets.get(socket.raw);
+                if (connection) {
+                    clearSocketMessagePorts(connection);
+                }
                 clearSocketRevalidation(socket.raw);
                 sockets.delete(socket.raw);
             },
             onError(_event, socket) {
+                const connection = sockets.get(socket.raw);
+                if (connection) {
+                    clearSocketMessagePorts(connection);
+                }
                 clearSocketRevalidation(socket.raw);
                 sockets.delete(socket.raw);
             },
             async onMessage(event, socket) {
+                const connection = sockets.get(socket.raw);
+                if (!connection) {
+                    return;
+                }
                 let message;
                 try {
                     message = JSON.parse(await websocketMessageText(event.data));
@@ -333,6 +451,35 @@ async function startIpcBridgeServer(options) {
                 }
                 if (message.type === "ipc-renderer-send") {
                     bridgeState.handleRendererSend?.(message.channel, message.args);
+                    return;
+                }
+                if (message.type === "ipc-renderer-post-message") {
+                    if (new Set(message.portIds).size !== message.portIds.length) {
+                        console.error("[ipc-bridge] duplicate transferred MessagePort id");
+                        return;
+                    }
+                    const ports = message.portIds.map((portId) => {
+                        const existingPort = connection.messagePorts.get(portId);
+                        if (existingPort) {
+                            existingPort.disconnect();
+                        }
+                        const port = new WebSocketMessagePort(portId, (payload) => {
+                            sendWebSocketMessage(socket, payload);
+                        }, () => connection.messagePorts.delete(portId));
+                        connection.messagePorts.set(portId, port);
+                        return port;
+                    });
+                    dispatchPostMessage(message.channel, message.message, ports, message.sourceUrl);
+                    return;
+                }
+                if (message.type === "message-port-message") {
+                    connection.messagePorts
+                        .get(message.portId)
+                        ?.receiveMessage(message.data);
+                    return;
+                }
+                if (message.type === "message-port-close") {
+                    connection.messagePorts.get(message.portId)?.disconnect();
                     return;
                 }
                 if (message.type === "workspace-directory-entries-request") {
@@ -385,7 +532,12 @@ async function startIpcBridgeServer(options) {
         rewriteRequestPath: (requestPath) => requestPath.slice("/@fs".length),
     }));
     app.all("/@fs/*", (context) => context.json({ error: "Not Found" }, 404));
-    app.use("/*", (0, bun_1.serveStatic)({ root: webviewRoot }));
+    app.use("/*", (0, bun_1.serveStatic)({
+        root: webviewRoot,
+        onFound: (filePath, context) => {
+            context.header("Cache-Control", cacheControlForWebviewFile(filePath));
+        },
+    }));
     app.get("*", (0, bun_1.serveStatic)({ root: webviewRoot, path: "index.html" }));
     app.notFound((context) => {
         return context.json({ error: "Not Found" }, 404);
@@ -422,6 +574,7 @@ async function startIpcBridgeServer(options) {
         stopping = true;
         bridgeState.broadcastToRenderer = undefined;
         for (const [rawSocket, connection] of sockets) {
+            clearSocketMessagePorts(connection);
             clearSocketRevalidation(rawSocket);
             connection.socket.close(1001, "server shutting down");
         }

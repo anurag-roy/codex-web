@@ -56,6 +56,7 @@ declare class BrowserWindow {
     once(event: string, listener: StubListener): unknown;
     off(event: string, listener: StubListener): unknown;
     removeListener(event: string, listener: StubListener): unknown;
+    loadURL(url: string): Promise<void>;
     close(): void;
     destroy(): void;
     isDestroyed(): boolean;
@@ -257,6 +258,15 @@ declare const protocol: {
     registerStringProtocol(...args: unknown[]): void;
 };
 declare function createSessionStub(label: string): {
+    cookies: {
+        get: (...args: unknown[]) => Promise<unknown[]>;
+        off: (event: string, listener: StubListener) => unknown;
+        on: (event: string, listener: StubListener) => unknown;
+        once: (event: string, listener: StubListener) => unknown;
+        remove: (...args: unknown[]) => Promise<void>;
+        removeListener: (event: string, listener: StubListener) => unknown;
+        set: (...args: unknown[]) => Promise<void>;
+    };
     getUserAgent: () => string;
     loadExtension: (extensionPath: string) => Promise<{
         id: string;
@@ -278,6 +288,15 @@ declare function createSessionStub(label: string): {
 };
 declare const session: {
     defaultSession: {
+        cookies: {
+            get: (...args: unknown[]) => Promise<unknown[]>;
+            off: (event: string, listener: StubListener) => unknown;
+            on: (event: string, listener: StubListener) => unknown;
+            once: (event: string, listener: StubListener) => unknown;
+            remove: (...args: unknown[]) => Promise<void>;
+            removeListener: (event: string, listener: StubListener) => unknown;
+            set: (...args: unknown[]) => Promise<void>;
+        };
         getUserAgent: () => string;
         loadExtension: (extensionPath: string) => Promise<{
             id: string;

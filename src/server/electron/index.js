@@ -111,13 +111,17 @@ const rendererWebContents = {
         });
     },
 };
-function createIpcMainEvent() {
+function createIpcMainEvent(ports = []) {
+    const sender = BrowserWindow.fromWebContents(rendererWebContents)
+        ?.webContents ??
+        rendererWebContents;
     const event = {
         returnValue: undefined,
         processId: 1,
         frameId: 1,
-        sender: rendererWebContents,
-        senderFrame: rendererMainFrame,
+        sender,
+        senderFrame: sender.mainFrame,
+        ports,
         reply: (channel, ...args) => {
             getIpcMainBridgeState().broadcastToRenderer?.({
                 type: "ipc-main-event",
@@ -132,6 +136,17 @@ function createIpcMainStub() {
     const emitter = createEmitterStub("ipcMain");
     const handlers = new Map();
     const bridgeState = getIpcMainBridgeState();
+    const pendingPostMessages = new Map();
+    const registeredPostMessageChannels = new Set();
+    bridgeState.handleRendererPostMessage = (channel, message, ports) => {
+        if (registeredPostMessageChannels.has(channel)) {
+            emitter.emit(channel, createIpcMainEvent(ports), message);
+            return;
+        }
+        const pending = pendingPostMessages.get(channel) ?? [];
+        pending.push({ message, ports });
+        pendingPostMessages.set(channel, pending);
+    };
     bridgeState.handleRendererInvoke = async (channel, args) => {
         const handler = handlers.get(channel);
         if (!handler) {
@@ -145,7 +160,18 @@ function createIpcMainStub() {
         emitter.emit(channel, event, ...args);
     };
     return {
-        on: emitter.on,
+        on(channel, listener) {
+            const result = emitter.on(channel, listener);
+            registeredPostMessageChannels.add(channel);
+            const pending = pendingPostMessages.get(channel);
+            if (pending) {
+                pendingPostMessages.delete(channel);
+                for (const { message, ports } of pending) {
+                    emitter.emit(channel, createIpcMainEvent(ports), message);
+                }
+            }
+            return result;
+        },
         off: emitter.off,
         handle(channel, handler) {
             log("ipcMain.handle", [channel, handler]);
@@ -290,8 +316,8 @@ class BrowserWindow {
             },
             getURL: () => {
                 log(`BrowserWindow#${this.id}.webContents.getURL`, []);
-                return String(this.webContents.mainFrame
-                    ?.url ?? "");
+                return String(this.webContents.mainFrame?.url ??
+                    "");
             },
             isDestroyed: () => this.destroyed,
             loadURL: async (url) => {
@@ -341,8 +367,7 @@ class BrowserWindow {
     }
     static getFocusedWindow() {
         log("BrowserWindow.getFocusedWindow", []);
-        if (BrowserWindow.focusedWindow &&
-            !BrowserWindow.focusedWindow.destroyed) {
+        if (BrowserWindow.focusedWindow && !BrowserWindow.focusedWindow.destroyed) {
             return BrowserWindow.focusedWindow;
         }
         return BrowserWindow.getAllWindows()[0] ?? null;
@@ -366,6 +391,10 @@ class BrowserWindow {
     }
     removeListener(event, listener) {
         return this.emitter.removeListener(event, listener);
+    }
+    async loadURL(url) {
+        log(`BrowserWindow#${this.id}.loadURL`, [url]);
+        this.webContents.mainFrame.url = url;
     }
     close() {
         log(`BrowserWindow#${this.id}.close`, []);
@@ -647,7 +676,24 @@ const protocol = {
 exports.protocol = protocol;
 function createSessionStub(label) {
     const emitter = createEmitterStub(label);
+    const cookiesEmitter = createEmitterStub(`${label}.cookies`);
     return {
+        cookies: {
+            async get(...args) {
+                log(`${label}.cookies.get`, args);
+                return [];
+            },
+            off: cookiesEmitter.off,
+            on: cookiesEmitter.on,
+            once: cookiesEmitter.once,
+            async remove(...args) {
+                log(`${label}.cookies.remove`, args);
+            },
+            removeListener: cookiesEmitter.removeListener,
+            async set(...args) {
+                log(`${label}.cookies.set`, args);
+            },
+        },
         async loadExtension(extensionPath) {
             log(`${label}.loadExtension`, [extensionPath]);
             return {
