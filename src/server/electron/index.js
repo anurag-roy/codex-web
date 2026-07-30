@@ -316,8 +316,8 @@ class BrowserWindow {
             },
             getURL: () => {
                 log(`BrowserWindow#${this.id}.webContents.getURL`, []);
-                return String(this.webContents.mainFrame?.url ??
-                    "");
+                return String(this.webContents.mainFrame
+                    ?.url ?? "");
             },
             isDestroyed: () => this.destroyed,
             loadURL: async (url) => {
@@ -367,7 +367,8 @@ class BrowserWindow {
     }
     static getFocusedWindow() {
         log("BrowserWindow.getFocusedWindow", []);
-        if (BrowserWindow.focusedWindow && !BrowserWindow.focusedWindow.destroyed) {
+        if (BrowserWindow.focusedWindow &&
+            !BrowserWindow.focusedWindow.destroyed) {
             return BrowserWindow.focusedWindow;
         }
         return BrowserWindow.getAllWindows()[0] ?? null;
@@ -676,24 +677,7 @@ const protocol = {
 exports.protocol = protocol;
 function createSessionStub(label) {
     const emitter = createEmitterStub(label);
-    const cookiesEmitter = createEmitterStub(`${label}.cookies`);
     return {
-        cookies: {
-            async get(...args) {
-                log(`${label}.cookies.get`, args);
-                return [];
-            },
-            off: cookiesEmitter.off,
-            on: cookiesEmitter.on,
-            once: cookiesEmitter.once,
-            async remove(...args) {
-                log(`${label}.cookies.remove`, args);
-            },
-            removeListener: cookiesEmitter.removeListener,
-            async set(...args) {
-                log(`${label}.cookies.set`, args);
-            },
-        },
         async loadExtension(extensionPath) {
             log(`${label}.loadExtension`, [extensionPath]);
             return {

@@ -48,26 +48,6 @@ type ServerEnvironment = {
   };
 };
 
-function cacheControlForWebviewFile(filePath: string): string {
-  const filename = path.basename(filePath);
-  const isAsset = path.basename(path.dirname(filePath)) === "assets";
-  const hasContentHash = [
-    /-[A-Za-z0-9_-]{8}\.[A-Za-z0-9]+$/,
-    /\.[a-z0-9]{10}\.[A-Za-z0-9]+$/,
-  ].some((pattern) => pattern.test(filename));
-
-  return isAsset &&
-    !new Set([
-      "dotnet.js",
-      "preload.js",
-      "preload.js.map",
-      "pwa-icon-512.png",
-    ]).has(filename) &&
-    hasContentHash
-    ? "public, max-age=31536000, immutable"
-    : "public, max-age=0";
-}
-
 type RendererToMainMessage =
   | {
       type: "ipc-renderer-invoke";
@@ -443,8 +423,6 @@ async function getWorkspaceDirectoryEntries({
 }
 
 function ensureElectronLikeProcessContext(): void {
-  process.env.BUILD_FLAVOR = "prod";
-
   const versions = process.versions as NodeJS.ProcessVersions & {
     electron?: string;
   };
@@ -865,9 +843,6 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
     "/*",
     serveStatic({
       root: webviewRoot,
-      onFound: (filePath, context) => {
-        context.header("Cache-Control", cacheControlForWebviewFile(filePath));
-      },
     }),
   );
   app.get("*", serveStatic({ root: webviewRoot, path: "index.html" }));

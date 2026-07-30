@@ -14,24 +14,6 @@ const bun_1 = require("hono/bun");
 const glob_1 = require("glob");
 const central_auth_js_1 = require("./central-auth.js");
 const login_page_js_1 = require("./login-page.js");
-function cacheControlForWebviewFile(filePath) {
-    const filename = node_path_1.default.basename(filePath);
-    const isAsset = node_path_1.default.basename(node_path_1.default.dirname(filePath)) === "assets";
-    const hasContentHash = [
-        /-[A-Za-z0-9_-]{8}\.[A-Za-z0-9]+$/,
-        /\.[a-z0-9]{10}\.[A-Za-z0-9]+$/,
-    ].some((pattern) => pattern.test(filename));
-    return isAsset &&
-        !new Set([
-            "dotnet.js",
-            "preload.js",
-            "preload.js.map",
-            "pwa-icon-512.png",
-        ]).has(filename) &&
-        hasContentHash
-        ? "public, max-age=31536000, immutable"
-        : "public, max-age=0";
-}
 class WebSocketMessagePort {
     portId;
     sendToRenderer;
@@ -237,7 +219,6 @@ async function getWorkspaceDirectoryEntries({ directoryPath, directoriesOnly, })
     };
 }
 function ensureElectronLikeProcessContext() {
-    process.env.BUILD_FLAVOR = "prod";
     const versions = process.versions;
     if (!versions.electron) {
         Object.defineProperty(versions, "electron", {
@@ -534,9 +515,6 @@ async function startIpcBridgeServer(options) {
     app.all("/@fs/*", (context) => context.json({ error: "Not Found" }, 404));
     app.use("/*", (0, bun_1.serveStatic)({
         root: webviewRoot,
-        onFound: (filePath, context) => {
-            context.header("Cache-Control", cacheControlForWebviewFile(filePath));
-        },
     }));
     app.get("*", (0, bun_1.serveStatic)({ root: webviewRoot, path: "index.html" }));
     app.notFound((context) => {
