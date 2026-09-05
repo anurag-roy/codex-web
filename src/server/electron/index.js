@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.dialog = exports.crashReporter = exports.webContents = exports.WebContentsView = exports.utilityProcess = exports.Tray = exports.session = exports.screen = exports.protocol = exports.powerMonitor = exports.Notification = exports.nativeTheme = exports.nativeImage = exports.net = exports.MessageChannelMain = exports.MenuItem = exports.Menu = exports.ipcMain = exports.BrowserWindow = exports.autoUpdater = exports.app = void 0;
+exports.dialog = exports.crashReporter = exports.webContents = exports.WebContentsView = exports.utilityProcess = exports.Tray = exports.session = exports.screen = exports.protocol = exports.globalShortcut = exports.powerSaveBlocker = exports.powerMonitor = exports.Notification = exports.nativeTheme = exports.nativeImage = exports.net = exports.MessageChannelMain = exports.MenuItem = exports.Menu = exports.ipcMain = exports.BrowserWindow = exports.autoUpdater = exports.app = void 0;
 function getIpcMainBridgeState() {
     const globals = globalThis;
     if (!globals.__codexElectronIpcBridge) {
@@ -294,17 +294,28 @@ const app = new Proxy(appBase, {
 });
 exports.app = app;
 class BrowserWindow {
+    static isInputShapeSupported() {
+        return false;
+    }
+    static isSystemBackdropSupported() {
+        return false;
+    }
+    static fromId(id) {
+        return (BrowserWindow.getAllWindows().find((window) => window.id === id) ?? null);
+    }
     static nextId = 1;
     static allWindows = [];
     static focusedWindow = null;
     id;
     destroyed = false;
+    visible = true;
     title = "Codex";
     bounds = { x: 0, y: 0, width: 1280, height: 820 };
     webContents;
     emitter;
     constructor(...args) {
         log("new BrowserWindow", args);
+        this.visible = args[0]?.show !== false;
         this.id = BrowserWindow.nextId++;
         this.emitter = createEmitterStub(`BrowserWindow#${this.id}`);
         const webContentsEmitter = createEmitterStub(`BrowserWindow#${this.id}.webContents`);
@@ -316,8 +327,8 @@ class BrowserWindow {
             },
             getURL: () => {
                 log(`BrowserWindow#${this.id}.webContents.getURL`, []);
-                return String(this.webContents.mainFrame
-                    ?.url ?? "");
+                return String(this.webContents.mainFrame?.url ??
+                    "");
             },
             isDestroyed: () => this.destroyed,
             loadURL: async (url) => {
@@ -344,22 +355,30 @@ class BrowserWindow {
             },
         }, {
             get: (target, prop) => {
+                // Async Electron APIs can return this proxy; it must not be thenable.
+                if (prop === "then") {
+                    return undefined;
+                }
                 if (prop in target) {
                     return target[prop];
                 }
                 return createDeepStub(`BrowserWindow#${this.id}.webContents.${String(prop)}`);
             },
         });
-        BrowserWindow.allWindows.push(this);
-        BrowserWindow.focusedWindow = this;
-        return new Proxy(this, {
+        const window = new Proxy(this, {
             get: (target, prop) => {
+                if (prop === "then") {
+                    return undefined;
+                }
                 if (prop in target) {
                     return target[prop];
                 }
                 return createDeepStub(`BrowserWindow#${target.id}.${String(prop)}`);
             },
         });
+        BrowserWindow.allWindows.push(window);
+        BrowserWindow.focusedWindow = window;
+        return window;
     }
     static getAllWindows() {
         log("BrowserWindow.getAllWindows", []);
@@ -367,8 +386,7 @@ class BrowserWindow {
     }
     static getFocusedWindow() {
         log("BrowserWindow.getFocusedWindow", []);
-        if (BrowserWindow.focusedWindow &&
-            !BrowserWindow.focusedWindow.destroyed) {
+        if (BrowserWindow.focusedWindow && !BrowserWindow.focusedWindow.destroyed) {
             return BrowserWindow.focusedWindow;
         }
         return BrowserWindow.getAllWindows()[0] ?? null;
@@ -420,6 +438,9 @@ class BrowserWindow {
         log(`BrowserWindow#${this.id}.isFocused`, []);
         return BrowserWindow.focusedWindow === this && !this.destroyed;
     }
+    isVisible() {
+        return this.visible && !this.destroyed;
+    }
     removeMenu() {
         log(`BrowserWindow#${this.id}.removeMenu`, []);
     }
@@ -446,9 +467,11 @@ class BrowserWindow {
     }
     show() {
         log(`BrowserWindow#${this.id}.show`, []);
+        this.visible = true;
     }
     hide() {
         log(`BrowserWindow#${this.id}.hide`, []);
+        this.visible = false;
     }
     focus() {
         log(`BrowserWindow#${this.id}.focus`, []);
@@ -638,8 +661,47 @@ const nativeImage = {
     },
 };
 exports.nativeImage = nativeImage;
-const powerMonitor = createEmitterStub("powerMonitor");
+const powerMonitor = {
+    ...createEmitterStub("powerMonitor"),
+    getSystemIdleState(_idleThreshold) {
+        return "unknown";
+    },
+    getSystemIdleTime() {
+        return 0;
+    },
+    isOnBatteryPower() {
+        return false;
+    },
+};
 exports.powerMonitor = powerMonitor;
+// Desktop shortcuts and sleep inhibitors have no native window in the web host.
+const globalShortcut = {
+    register(...args) {
+        log("globalShortcut.register", args);
+        return false;
+    },
+    isRegistered(_accelerator) {
+        return false;
+    },
+    unregister(...args) {
+        log("globalShortcut.unregister", args);
+    },
+    unregisterAll() { },
+};
+exports.globalShortcut = globalShortcut;
+const powerSaveBlocker = {
+    start(type) {
+        log("powerSaveBlocker.start", [type]);
+        return 0;
+    },
+    stop(id) {
+        log("powerSaveBlocker.stop", [id]);
+    },
+    isStarted(_id) {
+        return false;
+    },
+};
+exports.powerSaveBlocker = powerSaveBlocker;
 const screen = {
     ...createEmitterStub("screen"),
     getAllDisplays() {
@@ -678,6 +740,22 @@ exports.protocol = protocol;
 function createSessionStub(label) {
     const emitter = createEmitterStub(label);
     return {
+        cookies: {
+            ...createEmitterStub(`${label}.cookies`),
+            async get(...args) {
+                log(`${label}.cookies.get`, args);
+                return [];
+            },
+            async remove(...args) {
+                log(`${label}.cookies.remove`, args);
+            },
+            async set(...args) {
+                log(`${label}.cookies.set`, args);
+            },
+        },
+        async getDownloadHistory() {
+            return [];
+        },
         async loadExtension(extensionPath) {
             log(`${label}.loadExtension`, [extensionPath]);
             return {
@@ -701,6 +779,9 @@ function createSessionStub(label) {
         },
         setPermissionRequestHandler(...args) {
             log(`${label}.setPermissionRequestHandler`, args);
+        },
+        setPreferredLanguages(languages) {
+            log(`${label}.setPreferredLanguages`, [languages]);
         },
         webRequest: {
             onBeforeRequest(...args) {
@@ -764,6 +845,8 @@ const electronModule = new Proxy({
     nativeTheme,
     Notification,
     powerMonitor,
+    powerSaveBlocker,
+    globalShortcut,
     protocol,
     screen,
     session,
