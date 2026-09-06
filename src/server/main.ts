@@ -6,6 +6,7 @@ declare global {
   };
 }
 
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -423,6 +424,8 @@ async function getWorkspaceDirectoryEntries({
 }
 
 function ensureElectronLikeProcessContext(): void {
+  process.env.BUILD_FLAVOR = "prod";
+
   const versions = process.versions as NodeJS.ProcessVersions & {
     electron?: string;
   };
@@ -437,12 +440,20 @@ function ensureElectronLikeProcessContext(): void {
 
   const processWithElectronFields = process as NodeJS.Process & {
     _linkedBinding?: unknown;
+    getSystemVersion?: () => string;
     resourcesPath?: string;
     type?: string;
   };
   // Bun exposes this Node-internal hook but returns undefined for unknown
   // bindings. Electron callers expect an unsupported binding to be absent.
   processWithElectronFields._linkedBinding = undefined;
+  const systemVersion =
+    process.platform === "darwin"
+      ? execFileSync("/usr/bin/sw_vers", ["-productVersion"], {
+          encoding: "utf8",
+        }).trim()
+      : os.release();
+  processWithElectronFields.getSystemVersion ??= () => systemVersion;
   processWithElectronFields.resourcesPath ??= path.resolve(
     __dirname,
     "../../scratch/asar",
