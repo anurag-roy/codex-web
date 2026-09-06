@@ -1,4 +1,12 @@
 type StubListener = (...args: unknown[]) => void;
+declare function createEmitterStub(label: string): {
+    addListener: (event: string, listener: StubListener) => unknown;
+    emit: (event: string, ...args: unknown[]) => boolean;
+    off: (event: string, listener: StubListener) => unknown;
+    on: (event: string, listener: StubListener) => unknown;
+    once: (event: string, listener: StubListener) => unknown;
+    removeListener: (event: string, listener: StubListener) => unknown;
+};
 declare const appBase: {
     name: string;
     isPackaged: boolean;
@@ -37,11 +45,15 @@ declare const appBase: {
 };
 declare const app: typeof appBase;
 declare class BrowserWindow {
+    static isInputShapeSupported(): boolean;
+    static isSystemBackdropSupported(): boolean;
+    static fromId(id: number): BrowserWindow | null;
     static nextId: number;
     static allWindows: BrowserWindow[];
     static focusedWindow: BrowserWindow | null;
     id: number;
     private destroyed;
+    private visible;
     private title;
     private bounds;
     webContents: Record<string, unknown>;
@@ -61,6 +73,7 @@ declare class BrowserWindow {
     destroy(): void;
     isDestroyed(): boolean;
     isFocused(): boolean;
+    isVisible(): boolean;
     removeMenu(): void;
     getTitle(): string;
     setTitle(nextTitle: string): void;
@@ -165,12 +178,26 @@ declare const nativeImage: {
     };
 };
 declare const powerMonitor: {
+    getSystemIdleState(_idleThreshold: number): string;
+    getSystemIdleTime(): number;
+    isOnBatteryPower(): boolean;
     addListener: (event: string, listener: StubListener) => unknown;
     emit: (event: string, ...args: unknown[]) => boolean;
     off: (event: string, listener: StubListener) => unknown;
     on: (event: string, listener: StubListener) => unknown;
     once: (event: string, listener: StubListener) => unknown;
     removeListener: (event: string, listener: StubListener) => unknown;
+};
+declare const globalShortcut: {
+    register(...args: unknown[]): boolean;
+    isRegistered(_accelerator: string): boolean;
+    unregister(...args: unknown[]): void;
+    unregisterAll(): void;
+};
+declare const powerSaveBlocker: {
+    start(type: string): number;
+    stop(id: number): void;
+    isStarted(_id: number): boolean;
 };
 declare const screen: {
     getAllDisplays(): Array<{
@@ -258,7 +285,13 @@ declare const protocol: {
     registerStringProtocol(...args: unknown[]): void;
 };
 declare function createSessionStub(label: string): {
+    cookies: ReturnType<typeof createEmitterStub> & {
+        get: (...args: unknown[]) => Promise<unknown[]>;
+        remove: (...args: unknown[]) => Promise<void>;
+        set: (...args: unknown[]) => Promise<void>;
+    };
     getUserAgent: () => string;
+    getDownloadHistory: () => Promise<unknown[]>;
     loadExtension: (extensionPath: string) => Promise<{
         id: string;
         name: string;
@@ -272,6 +305,7 @@ declare function createSessionStub(label: string): {
     removeListener: (event: string, listener: StubListener) => unknown;
     setPermissionCheckHandler: (...args: unknown[]) => void;
     setPermissionRequestHandler: (...args: unknown[]) => void;
+    setPreferredLanguages: (languages: string[]) => void;
     webRequest: {
         onBeforeRequest: (...args: unknown[]) => void;
         onBeforeSendHeaders: (...args: unknown[]) => void;
@@ -279,7 +313,13 @@ declare function createSessionStub(label: string): {
 };
 declare const session: {
     defaultSession: {
+        cookies: ReturnType<typeof createEmitterStub> & {
+            get: (...args: unknown[]) => Promise<unknown[]>;
+            remove: (...args: unknown[]) => Promise<void>;
+            set: (...args: unknown[]) => Promise<void>;
+        };
         getUserAgent: () => string;
+        getDownloadHistory: () => Promise<unknown[]>;
         loadExtension: (extensionPath: string) => Promise<{
             id: string;
             name: string;
@@ -293,6 +333,7 @@ declare const session: {
         removeListener: (event: string, listener: StubListener) => unknown;
         setPermissionCheckHandler: (...args: unknown[]) => void;
         setPermissionRequestHandler: (...args: unknown[]) => void;
+        setPreferredLanguages: (languages: string[]) => void;
         webRequest: {
             onBeforeRequest: (...args: unknown[]) => void;
             onBeforeSendHeaders: (...args: unknown[]) => void;
@@ -321,6 +362,6 @@ declare class MessageChannelMain {
     };
 }
 declare const electronModule: Record<string, unknown>;
-export { app, autoUpdater, BrowserWindow, ipcMain, Menu, MenuItem, MessageChannelMain, net, nativeImage, nativeTheme, Notification, powerMonitor, protocol, screen, session, Tray, utilityProcess, WebContentsView, webContents, crashReporter, dialog, };
+export { app, autoUpdater, BrowserWindow, ipcMain, Menu, MenuItem, MessageChannelMain, net, nativeImage, nativeTheme, Notification, powerMonitor, powerSaveBlocker, globalShortcut, protocol, screen, session, Tray, utilityProcess, WebContentsView, webContents, crashReporter, dialog, };
 export default electronModule;
 //# sourceMappingURL=index.d.ts.map
