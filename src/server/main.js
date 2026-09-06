@@ -4,6 +4,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+const node_child_process_1 = require("node:child_process");
 const node_crypto_1 = require("node:crypto");
 const promises_1 = __importDefault(require("node:fs/promises"));
 const node_os_1 = __importDefault(require("node:os"));
@@ -219,6 +220,7 @@ async function getWorkspaceDirectoryEntries({ directoryPath, directoriesOnly, })
     };
 }
 function ensureElectronLikeProcessContext() {
+    process.env.BUILD_FLAVOR = "prod";
     const versions = process.versions;
     if (!versions.electron) {
         Object.defineProperty(versions, "electron", {
@@ -232,6 +234,12 @@ function ensureElectronLikeProcessContext() {
     // Bun exposes this Node-internal hook but returns undefined for unknown
     // bindings. Electron callers expect an unsupported binding to be absent.
     processWithElectronFields._linkedBinding = undefined;
+    const systemVersion = process.platform === "darwin"
+        ? (0, node_child_process_1.execFileSync)("/usr/bin/sw_vers", ["-productVersion"], {
+            encoding: "utf8",
+        }).trim()
+        : node_os_1.default.release();
+    processWithElectronFields.getSystemVersion ??= () => systemVersion;
     processWithElectronFields.resourcesPath ??= node_path_1.default.resolve(__dirname, "../../scratch/asar");
     processWithElectronFields.type ??= "browser";
 }
