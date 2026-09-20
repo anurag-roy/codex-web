@@ -89,48 +89,23 @@ function createMessagePortStub(label) {
         },
     };
 }
-const rendererUrl = "http://localhost:5175/";
-const rendererMainFrame = {
-    url: rendererUrl,
-};
-const rendererWebContentsEmitter = createEmitterStub("ipcMainEvent.sender");
-const rendererWebContents = {
-    id: 1001,
-    mainFrame: rendererMainFrame,
-    getURL: () => rendererMainFrame.url,
-    isDestroyed: () => false,
-    off: rendererWebContentsEmitter.off,
-    on: rendererWebContentsEmitter.on,
-    once: rendererWebContentsEmitter.once,
-    removeListener: rendererWebContentsEmitter.removeListener,
-    send: (channel, ...args) => {
-        getIpcMainBridgeState().broadcastToRenderer?.({
-            type: "ipc-main-event",
-            channel,
-            args,
-        });
-    },
-};
-function createIpcMainEvent(ports = []) {
-    const sender = BrowserWindow.fromWebContents(rendererWebContents)
-        ?.webContents ??
-        rendererWebContents;
-    const event = {
+function createIpcMainEvent(windowId, ports = []) {
+    const window = BrowserWindow.fromId(windowId);
+    if (!window || window.isDestroyed()) {
+        throw new Error(`[electron-main-stub] Renderer window ${windowId} is closed`);
+    }
+    const sender = window.webContents;
+    return {
         returnValue: undefined,
-        processId: 1,
+        processId: windowId,
         frameId: 1,
         sender,
         senderFrame: sender.mainFrame,
         ports,
         reply: (channel, ...args) => {
-            getIpcMainBridgeState().broadcastToRenderer?.({
-                type: "ipc-main-event",
-                channel,
-                args,
-            });
+            sender.send(channel, ...args);
         },
     };
-    return event;
 }
 function createIpcMainStub() {
     const emitter = createEmitterStub("ipcMain");
@@ -138,25 +113,25 @@ function createIpcMainStub() {
     const bridgeState = getIpcMainBridgeState();
     const pendingPostMessages = new Map();
     const registeredPostMessageChannels = new Set();
-    bridgeState.handleRendererPostMessage = (channel, message, ports) => {
+    bridgeState.handleRendererPostMessage = (channel, message, ports, windowId) => {
         if (registeredPostMessageChannels.has(channel)) {
-            emitter.emit(channel, createIpcMainEvent(ports), message);
+            emitter.emit(channel, createIpcMainEvent(windowId, ports), message);
             return;
         }
         const pending = pendingPostMessages.get(channel) ?? [];
-        pending.push({ message, ports });
+        pending.push({ message, ports, windowId });
         pendingPostMessages.set(channel, pending);
     };
-    bridgeState.handleRendererInvoke = async (channel, args) => {
+    bridgeState.handleRendererInvoke = async (channel, args, windowId) => {
         const handler = handlers.get(channel);
         if (!handler) {
             throw new Error(`[electron-main-stub] No ipcMain.handle for ${channel}`);
         }
-        const event = createIpcMainEvent();
+        const event = createIpcMainEvent(windowId);
         return await Promise.resolve(handler(event, ...args));
     };
-    bridgeState.handleRendererSend = (channel, args, sourceUrl) => {
-        const event = createIpcMainEvent();
+    bridgeState.handleRendererSend = (channel, args, windowId) => {
+        const event = createIpcMainEvent(windowId);
         emitter.emit(channel, event, ...args);
     };
     return {
@@ -166,8 +141,10 @@ function createIpcMainStub() {
             const pending = pendingPostMessages.get(channel);
             if (pending) {
                 pendingPostMessages.delete(channel);
-                for (const { message, ports } of pending) {
-                    emitter.emit(channel, createIpcMainEvent(ports), message);
+                for (const { message, ports, windowId } of pending) {
+                    if (!BrowserWindow.fromId(windowId))
+                        continue;
+                    emitter.emit(channel, createIpcMainEvent(windowId, ports), message);
                 }
             }
             return result;
@@ -347,7 +324,7 @@ class BrowserWindow {
                     return;
                 }
                 const [channel, ...args] = sendArgs;
-                getIpcMainBridgeState().broadcastToRenderer?.({
+                getIpcMainBridgeState().sendToRenderer?.(this.webContents.id, {
                     type: "ipc-main-event",
                     channel,
                     args,
@@ -424,7 +401,11 @@ class BrowserWindow {
     }
     destroy() {
         log(`BrowserWindow#${this.id}.destroy`, []);
+        if (this.destroyed)
+            return;
         this.destroyed = true;
+        this.webContents.emit("destroyed");
+        BrowserWindow.allWindows = BrowserWindow.allWindows.filter((window) => window !== this);
         if (BrowserWindow.focusedWindow === this) {
             BrowserWindow.focusedWindow = null;
         }

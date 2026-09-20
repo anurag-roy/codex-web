@@ -247,6 +247,16 @@ async function startIpcBridgeServer(options) {
     const bridgeState = getIpcMainBridgeState();
     const app = new hono_1.Hono();
     const sockets = new Map();
+    const rendererSockets = new Map();
+    const rendererWindowFactory = new Promise((resolve) => {
+        bridgeState.setRendererWindowFactory = resolve;
+    });
+    bridgeState.sendToRenderer = (webContentsId, message) => {
+        const socket = rendererSockets.get(webContentsId);
+        if (socket) {
+            sendWebSocketMessage(socket, message);
+        }
+    };
     const uploadRoot = await promises_1.default.mkdtemp(node_path_1.default.join(node_os_1.default.tmpdir(), "codex-web-uploads-"));
     const webviewRoot = node_path_1.default.resolve(__dirname, "../../scratch/asar/webview");
     const allowedAppOrigins = (0, central_auth_js_1.getCodexWebOrigins)();
@@ -318,6 +328,14 @@ async function startIpcBridgeServer(options) {
         }
         connection.messagePorts.clear();
     }
+    function clearSocketRendererWindow(connection) {
+        if (!connection.rendererWindow) {
+            return;
+        }
+        rendererSockets.delete(connection.rendererWindow.webContents.id);
+        connection.rendererWindow.destroy();
+        connection.rendererWindow = undefined;
+    }
     function clearSocketRevalidation(rawSocket) {
         const connection = sockets.get(rawSocket);
         if (connection?.revalidationTimer) {
@@ -345,16 +363,43 @@ async function startIpcBridgeServer(options) {
             });
         }, SESSION_REVALIDATION_INTERVAL_MS);
     }
-    function dispatchPostMessage(channel, message, ports, sourceUrl) {
+    function dispatchPostMessage(channel, message, ports, windowId) {
         const handler = bridgeState.handleRendererPostMessage;
         if (handler) {
-            handler(channel, message, ports, sourceUrl);
+            handler(channel, message, ports, windowId);
             return;
         }
         console.error(`[ipc-bridge] no ipcMain postMessage handler for channel ${channel}`);
         for (const port of ports) {
             port.close();
         }
+    }
+    function createRendererWindowForSocket(socket) {
+        // Each tab is a real registered app view, with its own IPC client and ownership.
+        return rendererWindowFactory
+            .then(async (createWindow) => {
+            if (socket.readyState !== OPEN_WEBSOCKET_READY_STATE) {
+                return undefined;
+            }
+            const window = await createWindow();
+            if (socket.readyState !== OPEN_WEBSOCKET_READY_STATE) {
+                window.destroy();
+                return undefined;
+            }
+            const connection = sockets.get(socket.raw);
+            if (!connection || connection.socket !== socket) {
+                window.destroy();
+                return undefined;
+            }
+            connection.rendererWindow = window;
+            rendererSockets.set(window.webContents.id, socket);
+            return window;
+        })
+            .catch((error) => {
+            console.error("[ipc-bridge] failed to create renderer window", error);
+            socket.close(1011, "Renderer initialization failed");
+            return undefined;
+        });
     }
     app.use("/__backend/*", requireCentralAuthApi);
     app.use("/@fs/*", requireCentralAuthApi);
@@ -401,18 +446,22 @@ async function startIpcBridgeServer(options) {
         const authCookie = auth.enabled ? auth.cookie : null;
         return {
             onOpen(_event, socket) {
-                sockets.set(socket.raw, {
+                const connection = {
                     authCookie,
                     messagePorts: new Map(),
+                    rendererReady: Promise.resolve(undefined),
                     revalidationTimer: null,
                     socket,
-                });
+                };
+                sockets.set(socket.raw, connection);
+                connection.rendererReady = createRendererWindowForSocket(socket);
                 scheduleSocketRevalidation(socket.raw);
             },
             onClose(_event, socket) {
                 const connection = sockets.get(socket.raw);
                 if (connection) {
                     clearSocketMessagePorts(connection);
+                    clearSocketRendererWindow(connection);
                 }
                 clearSocketRevalidation(socket.raw);
                 sockets.delete(socket.raw);
@@ -421,6 +470,7 @@ async function startIpcBridgeServer(options) {
                 const connection = sockets.get(socket.raw);
                 if (connection) {
                     clearSocketMessagePorts(connection);
+                    clearSocketRendererWindow(connection);
                 }
                 clearSocketRevalidation(socket.raw);
                 sockets.delete(socket.raw);
@@ -428,6 +478,12 @@ async function startIpcBridgeServer(options) {
             async onMessage(event, socket) {
                 const connection = sockets.get(socket.raw);
                 if (!connection) {
+                    return;
+                }
+                const window = await connection.rendererReady;
+                if (!window ||
+                    socket.readyState !== OPEN_WEBSOCKET_READY_STATE ||
+                    sockets.get(socket.raw) !== connection) {
                     return;
                 }
                 let message;
@@ -439,7 +495,7 @@ async function startIpcBridgeServer(options) {
                     return;
                 }
                 if (message.type === "ipc-renderer-send") {
-                    bridgeState.handleRendererSend?.(message.channel, message.args);
+                    bridgeState.handleRendererSend?.(message.channel, message.args, window.id);
                     return;
                 }
                 if (message.type === "ipc-renderer-post-message") {
@@ -458,7 +514,7 @@ async function startIpcBridgeServer(options) {
                         connection.messagePorts.set(portId, port);
                         return port;
                     });
-                    dispatchPostMessage(message.channel, message.message, ports, message.sourceUrl);
+                    dispatchPostMessage(message.channel, message.message, ports, window.id);
                     return;
                 }
                 if (message.type === "message-port-message") {
@@ -494,7 +550,7 @@ async function startIpcBridgeServer(options) {
                 }
                 if (message.type === "ipc-renderer-invoke") {
                     const { channel, requestId, args } = message;
-                    Promise.resolve(bridgeState.handleRendererInvoke?.(channel, args) ??
+                    Promise.resolve(bridgeState.handleRendererInvoke?.(channel, args, window.id) ??
                         Promise.reject(new Error(`[ipc-bridge] no ipcMain.handle for channel ${channel}`)))
                         .then((result) => {
                         sendWebSocketMessage(socket, {
@@ -532,11 +588,6 @@ async function startIpcBridgeServer(options) {
         console.error("[ipc-bridge] request failed", error);
         return context.json({ error: "Internal Server Error" }, 500);
     });
-    bridgeState.broadcastToRenderer = (message) => {
-        for (const connection of sockets.values()) {
-            sendWebSocketMessage(connection.socket, message);
-        }
-    };
     const server = Bun.serve({
         hostname: options.host,
         port: options.port,
@@ -558,13 +609,15 @@ async function startIpcBridgeServer(options) {
             return;
         }
         stopping = true;
-        bridgeState.broadcastToRenderer = undefined;
+        bridgeState.sendToRenderer = undefined;
         for (const [rawSocket, connection] of sockets) {
             clearSocketMessagePorts(connection);
+            clearSocketRendererWindow(connection);
             clearSocketRevalidation(rawSocket);
             connection.socket.close(1001, "server shutting down");
         }
         sockets.clear();
+        rendererSockets.clear();
         await server.stop(true);
         await promises_1.default.rm(uploadRoot, { recursive: true, force: true });
     };

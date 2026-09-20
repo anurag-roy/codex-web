@@ -249,21 +249,41 @@ function compareWorkspaceDirectoryEntries(
   );
 }
 
+type RendererWindow = {
+  id: number;
+  webContents: { id: number };
+  destroy: () => void;
+};
+
 type IpcMainBridgeState = {
-  broadcastToRenderer?: (message: MainToRendererMessage) => void;
-  handleRendererInvoke?: (channel: string, args: unknown[]) => Promise<unknown>;
+  setRendererWindowFactory?: (factory: () => Promise<RendererWindow>) => void;
+  sendToRenderer?: (
+    webContentsId: number,
+    message: MainToRendererMessage,
+  ) => void;
+  handleRendererInvoke?: (
+    channel: string,
+    args: unknown[],
+    windowId: number,
+  ) => Promise<unknown>;
   handleRendererPostMessage?: (
     channel: string,
     message: unknown,
     ports: BridgedMessagePort[],
-    sourceUrl?: string,
+    windowId: number,
   ) => void;
-  handleRendererSend?: (channel: string, args: unknown[]) => void;
+  handleRendererSend?: (
+    channel: string,
+    args: unknown[],
+    windowId: number,
+  ) => void;
 };
 
 type SocketConnection = {
   authCookie: string | null;
   messagePorts: Map<string, WebSocketMessagePort>;
+  rendererReady: Promise<RendererWindow | undefined>;
+  rendererWindow?: RendererWindow;
   revalidationTimer: ReturnType<typeof setTimeout> | null;
   socket: WSContext;
 };
@@ -465,6 +485,18 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
   const bridgeState = getIpcMainBridgeState();
   const app = new Hono<ServerEnvironment>();
   const sockets = new Map<unknown, SocketConnection>();
+  const rendererSockets = new Map<number, WSContext>();
+  const rendererWindowFactory = new Promise<() => Promise<RendererWindow>>(
+    (resolve) => {
+      bridgeState.setRendererWindowFactory = resolve;
+    },
+  );
+  bridgeState.sendToRenderer = (webContentsId, message): void => {
+    const socket = rendererSockets.get(webContentsId);
+    if (socket) {
+      sendWebSocketMessage(socket, message);
+    }
+  };
 
   const uploadRoot = await fs.mkdtemp(
     path.join(os.tmpdir(), "codex-web-uploads-"),
@@ -584,6 +616,15 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
     connection.messagePorts.clear();
   }
 
+  function clearSocketRendererWindow(connection: SocketConnection): void {
+    if (!connection.rendererWindow) {
+      return;
+    }
+    rendererSockets.delete(connection.rendererWindow.webContents.id);
+    connection.rendererWindow.destroy();
+    connection.rendererWindow = undefined;
+  }
+
   function clearSocketRevalidation(rawSocket: unknown): void {
     const connection = sockets.get(rawSocket);
     if (connection?.revalidationTimer) {
@@ -623,11 +664,11 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
     channel: string,
     message: unknown,
     ports: WebSocketMessagePort[],
-    sourceUrl?: string,
+    windowId: number,
   ): void {
     const handler = bridgeState.handleRendererPostMessage;
     if (handler) {
-      handler(channel, message, ports, sourceUrl);
+      handler(channel, message, ports, windowId);
       return;
     }
 
@@ -637,6 +678,36 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
     for (const port of ports) {
       port.close();
     }
+  }
+
+  function createRendererWindowForSocket(
+    socket: WSContext,
+  ): Promise<RendererWindow | undefined> {
+    // Each tab is a real registered app view, with its own IPC client and ownership.
+    return rendererWindowFactory
+      .then(async (createWindow) => {
+        if (socket.readyState !== OPEN_WEBSOCKET_READY_STATE) {
+          return undefined;
+        }
+        const window = await createWindow();
+        if (socket.readyState !== OPEN_WEBSOCKET_READY_STATE) {
+          window.destroy();
+          return undefined;
+        }
+        const connection = sockets.get(socket.raw);
+        if (!connection || connection.socket !== socket) {
+          window.destroy();
+          return undefined;
+        }
+        connection.rendererWindow = window;
+        rendererSockets.set(window.webContents.id, socket);
+        return window;
+      })
+      .catch((error) => {
+        console.error("[ipc-bridge] failed to create renderer window", error);
+        socket.close(1011, "Renderer initialization failed");
+        return undefined;
+      });
   }
 
   app.use("/__backend/*", requireCentralAuthApi);
@@ -696,18 +767,22 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
 
       return {
         onOpen(_event, socket) {
-          sockets.set(socket.raw, {
+          const connection: SocketConnection = {
             authCookie,
             messagePorts: new Map(),
+            rendererReady: Promise.resolve(undefined),
             revalidationTimer: null,
             socket,
-          });
+          };
+          sockets.set(socket.raw, connection);
+          connection.rendererReady = createRendererWindowForSocket(socket);
           scheduleSocketRevalidation(socket.raw);
         },
         onClose(_event, socket) {
           const connection = sockets.get(socket.raw);
           if (connection) {
             clearSocketMessagePorts(connection);
+            clearSocketRendererWindow(connection);
           }
           clearSocketRevalidation(socket.raw);
           sockets.delete(socket.raw);
@@ -716,6 +791,7 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
           const connection = sockets.get(socket.raw);
           if (connection) {
             clearSocketMessagePorts(connection);
+            clearSocketRendererWindow(connection);
           }
           clearSocketRevalidation(socket.raw);
           sockets.delete(socket.raw);
@@ -723,6 +799,15 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
         async onMessage(event, socket) {
           const connection = sockets.get(socket.raw);
           if (!connection) {
+            return;
+          }
+
+          const window = await connection.rendererReady;
+          if (
+            !window ||
+            socket.readyState !== OPEN_WEBSOCKET_READY_STATE ||
+            sockets.get(socket.raw) !== connection
+          ) {
             return;
           }
 
@@ -737,7 +822,11 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
           }
 
           if (message.type === "ipc-renderer-send") {
-            bridgeState.handleRendererSend?.(message.channel, message.args);
+            bridgeState.handleRendererSend?.(
+              message.channel,
+              message.args,
+              window.id,
+            );
             return;
           }
 
@@ -769,7 +858,7 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
               message.channel,
               message.message,
               ports,
-              message.sourceUrl,
+              window.id,
             );
             return;
           }
@@ -811,7 +900,7 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
           if (message.type === "ipc-renderer-invoke") {
             const { channel, requestId, args } = message;
             Promise.resolve(
-              bridgeState.handleRendererInvoke?.(channel, args) ??
+              bridgeState.handleRendererInvoke?.(channel, args, window.id) ??
                 Promise.reject(
                   new Error(
                     `[ipc-bridge] no ipcMain.handle for channel ${channel}`,
@@ -867,12 +956,6 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
     return context.json({ error: "Internal Server Error" }, 500);
   });
 
-  bridgeState.broadcastToRenderer = (message: MainToRendererMessage): void => {
-    for (const connection of sockets.values()) {
-      sendWebSocketMessage(connection.socket, message);
-    }
-  };
-
   const server = Bun.serve({
     hostname: options.host,
     port: options.port,
@@ -897,13 +980,15 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
       return;
     }
     stopping = true;
-    bridgeState.broadcastToRenderer = undefined;
+    bridgeState.sendToRenderer = undefined;
     for (const [rawSocket, connection] of sockets) {
       clearSocketMessagePorts(connection);
+      clearSocketRendererWindow(connection);
       clearSocketRevalidation(rawSocket);
       connection.socket.close(1001, "server shutting down");
     }
     sockets.clear();
+    rendererSockets.clear();
     await server.stop(true);
     await fs.rm(uploadRoot, { recursive: true, force: true });
   };
