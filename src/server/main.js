@@ -12,7 +12,6 @@ const node_path_1 = __importDefault(require("node:path"));
 const node_util_1 = require("node:util");
 const hono_1 = require("hono");
 const bun_1 = require("hono/bun");
-const glob_1 = require("glob");
 const central_auth_js_1 = require("./central-auth.js");
 const login_page_js_1 = require("./login-page.js");
 class WebSocketMessagePort {
@@ -632,18 +631,8 @@ async function startIpcBridgeServer(options) {
     globalThis.__CODEX_SHIM_VALUES__ = {
         version: packageJson.version,
     };
-    const matches = await (0, glob_1.glob)("../../scratch/asar/.vite/build/main-*.js", {
-        nodir: true,
-        cwd: __dirname,
-    });
-    if (matches.length === 0) {
-        throw new Error("no main bundle found");
-    }
-    if (matches.length > 1) {
-        throw new Error("multiple main bundles found");
-    }
-    const module = require(matches[0]);
-    module.runMainAppStartup();
+    // The upstream entrypoint initializes network policy and starts the app once.
+    require(node_path_1.default.resolve(__dirname, "../../scratch/asar", packageJson.main));
 }
 async function main(args) {
     const options = parseServerArgs(args);
