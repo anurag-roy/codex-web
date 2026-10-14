@@ -15,7 +15,6 @@ import { parseArgs as parseCliArgs } from "node:util";
 import { Hono, type Context, type Next } from "hono";
 import { serveStatic, upgradeWebSocket, websocket } from "hono/bun";
 import type { WSContext, WSMessageReceive } from "hono/ws";
-import { glob } from "glob";
 import {
   CENTRAL_AUTH_ORIGIN,
   type CentralAuthSession,
@@ -1013,21 +1012,8 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
     version: packageJson.version,
   };
 
-  const matches = await glob("../../scratch/asar/.vite/build/main-*.js", {
-    nodir: true,
-    cwd: __dirname,
-  });
-
-  if (matches.length === 0) {
-    throw new Error("no main bundle found");
-  }
-
-  if (matches.length > 1) {
-    throw new Error("multiple main bundles found");
-  }
-
-  const module = require(matches[0]!);
-  module.runMainAppStartup();
+  // The upstream entrypoint initializes network policy and starts the app once.
+  require(path.resolve(__dirname, "../../scratch/asar", packageJson.main));
 }
 
 async function main(args: string[]) {
