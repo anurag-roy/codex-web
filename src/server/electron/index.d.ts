@@ -142,6 +142,7 @@ declare const crashReporter: {
     start(...args: unknown[]): void;
 };
 declare const net: {
+    isOnline(): boolean;
     fetch(input: string | URL, init?: RequestInit): Promise<Response>;
     request(...args: unknown[]): {
         getHeader: (name: string) => string | undefined;
