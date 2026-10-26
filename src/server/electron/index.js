@@ -437,6 +437,9 @@ class BrowserWindow {
         log(`BrowserWindow#${this.id}.getBounds`, []);
         return { ...this.bounds };
     }
+    getNormalBounds() {
+        return this.getBounds();
+    }
     setBounds(nextBounds) {
         log(`BrowserWindow#${this.id}.setBounds`, [nextBounds]);
         this.bounds = {
@@ -587,6 +590,11 @@ const crashReporter = {
 };
 exports.crashReporter = crashReporter;
 const net = {
+    isOnline() {
+        // There is no Chromium network monitor in the headless host. Let transports
+        // attempt reconnects and determine connectivity from their own results.
+        return true;
+    },
     async fetch(input, init) {
         // log("net.fetch", [input, init]);
         if (typeof globalThis.fetch === "function") {
@@ -685,6 +693,9 @@ const powerSaveBlocker = {
 exports.powerSaveBlocker = powerSaveBlocker;
 const screen = {
     ...createEmitterStub("screen"),
+    isCursorScreenPointSupported() {
+        return false;
+    },
     getAllDisplays() {
         log("screen.getAllDisplays", []);
         return [this.getPrimaryDisplay()];
@@ -761,8 +772,14 @@ function createSessionStub(label) {
         setPermissionRequestHandler(...args) {
             log(`${label}.setPermissionRequestHandler`, args);
         },
+        setPermissionPromptHandler(...args) {
+            log(`${label}.setPermissionPromptHandler`, args);
+        },
         setPreferredLanguages(languages) {
             log(`${label}.setPreferredLanguages`, [languages]);
+        },
+        setWebsiteReportingEnabled(enabled) {
+            log(`${label}.setWebsiteReportingEnabled`, [enabled]);
         },
         webRequest: {
             onBeforeRequest(...args) {

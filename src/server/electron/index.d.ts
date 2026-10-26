@@ -83,6 +83,12 @@ declare class BrowserWindow {
         x: number;
         y: number;
     };
+    getNormalBounds(): {
+        height: number;
+        width: number;
+        x: number;
+        y: number;
+    };
     setBounds(nextBounds: {
         height?: number;
         width?: number;
@@ -136,6 +142,7 @@ declare const crashReporter: {
     start(...args: unknown[]): void;
 };
 declare const net: {
+    isOnline(): boolean;
     fetch(input: string | URL, init?: RequestInit): Promise<Response>;
     request(...args: unknown[]): {
         getHeader: (name: string) => string | undefined;
@@ -200,6 +207,7 @@ declare const powerSaveBlocker: {
     isStarted(_id: number): boolean;
 };
 declare const screen: {
+    isCursorScreenPointSupported(): boolean;
     getAllDisplays(): Array<{
         id: number;
         scaleFactor: number;
@@ -305,7 +313,9 @@ declare function createSessionStub(label: string): {
     removeListener: (event: string, listener: StubListener) => unknown;
     setPermissionCheckHandler: (...args: unknown[]) => void;
     setPermissionRequestHandler: (...args: unknown[]) => void;
+    setPermissionPromptHandler: (...args: unknown[]) => void;
     setPreferredLanguages: (languages: string[]) => void;
+    setWebsiteReportingEnabled: (enabled: boolean) => void;
     webRequest: {
         onBeforeRequest: (...args: unknown[]) => void;
         onBeforeSendHeaders: (...args: unknown[]) => void;
@@ -333,7 +343,9 @@ declare const session: {
         removeListener: (event: string, listener: StubListener) => unknown;
         setPermissionCheckHandler: (...args: unknown[]) => void;
         setPermissionRequestHandler: (...args: unknown[]) => void;
+        setPermissionPromptHandler: (...args: unknown[]) => void;
         setPreferredLanguages: (languages: string[]) => void;
+        setWebsiteReportingEnabled: (enabled: boolean) => void;
         webRequest: {
             onBeforeRequest: (...args: unknown[]) => void;
             onBeforeSendHeaders: (...args: unknown[]) => void;
