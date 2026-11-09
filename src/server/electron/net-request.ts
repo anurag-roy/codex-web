@@ -207,7 +207,9 @@ export class NetRequest extends Writable {
       }
       const response = Object.assign(
         result.body
-          ? Readable.fromWeb(result.body as ReadableStream)
+          ? // Bun's fetch body stream type does not overlap node:stream/web's
+            // ReadableStream; cast through unknown for Readable.fromWeb.
+            Readable.fromWeb(result.body as unknown as ReadableStream)
           : Readable.from([]),
         {
           statusCode: result.status,

@@ -1,3 +1,4 @@
+import { NetRequest } from "./net-request";
 type StubListener = (...args: unknown[]) => void;
 declare function createEmitterStub(label: string): {
     addListener: (event: string, listener: StubListener) => unknown;
@@ -144,11 +145,7 @@ declare const crashReporter: {
 declare const net: {
     isOnline(): boolean;
     fetch(input: string | URL, init?: RequestInit): Promise<Response>;
-    request(...args: unknown[]): {
-        getHeader: (name: string) => string | undefined;
-        once: (event: string, listener: StubListener) => unknown;
-        setHeader: (name: string, value: string) => void;
-    };
+    request(options: ConstructorParameters<typeof NetRequest>[0]): NetRequest;
 };
 declare const autoUpdater: {
     addListener: (event: string, listener: StubListener) => unknown;
