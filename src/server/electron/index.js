@@ -1,6 +1,8 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.dialog = exports.crashReporter = exports.webContents = exports.WebContentsView = exports.utilityProcess = exports.Tray = exports.session = exports.screen = exports.protocol = exports.globalShortcut = exports.powerSaveBlocker = exports.powerMonitor = exports.Notification = exports.nativeTheme = exports.nativeImage = exports.net = exports.MessageChannelMain = exports.MenuItem = exports.Menu = exports.ipcMain = exports.BrowserWindow = exports.autoUpdater = exports.app = void 0;
+const node_util_1 = require("node:util");
+const net_request_1 = require("./net-request");
 function getIpcMainBridgeState() {
     const globals = globalThis;
     if (!globals.__codexElectronIpcBridge) {
@@ -8,8 +10,18 @@ function getIpcMainBridgeState() {
     }
     return globals.__codexElectronIpcBridge;
 }
+const debugShim = process.env.CODEX_WEB_DEBUG_SHIM === "1";
 function log(method, args) {
-    console.log(`[electron-main-stub] ${method}`, args);
+    if (!debugShim)
+        return;
+    const details = (0, node_util_1.inspect)(args, {
+        depth: 2,
+        maxArrayLength: 10,
+        maxStringLength: 200,
+        breakLength: Infinity,
+        compact: true,
+    }).replaceAll("\n", " ");
+    console.log(`[electron-main-stub] ${method} ${details}`.slice(0, 2000));
 }
 function createDeepStub(pathLabel) {
     const fn = (...args) => {
@@ -602,24 +614,8 @@ const net = {
         }
         return new Response("", { status: 204 });
     },
-    request(...args) {
-        // log("net.request", args);
-        const headers = new Map();
-        const request = {
-            setHeader(name, value) {
-                // log("net.request.setHeader", [name, value]);
-                headers.set(name.toLowerCase(), value);
-            },
-            getHeader(name) {
-                // log("net.request.getHeader", [name]);
-                return headers.get(name.toLowerCase());
-            },
-            once(event, listener) {
-                // log("net.request.once", [event, listener]);
-                return request;
-            },
-        };
-        return request;
+    request(options) {
+        return new net_request_1.NetRequest(options);
     },
 };
 exports.net = net;
@@ -645,7 +641,8 @@ const nativeImage = {
     createFromPath(imagePath) {
         log("nativeImage.createFromPath", [imagePath]);
         return {
-            isEmpty: () => !imagePath,
+            // Image decoding is unsupported in the headless host.
+            isEmpty: () => true,
         };
     },
 };

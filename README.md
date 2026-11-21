@@ -69,6 +69,10 @@ CODEX_WEB_ORIGINS=https://codex.anuragroy.dev bun run server
 
 Do not expose `server:local` through a reverse proxy or tunnel.
 
+Electron shim call tracing is disabled by default. Set
+`CODEX_WEB_DEBUG_SHIM=1` to enable bounded diagnostic traces; these can contain
+request data. Application warnings and errors remain enabled.
+
 ### sign in
 
 ensure the codex cli on the host machine is signed in before starting the
